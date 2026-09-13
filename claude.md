@@ -1,296 +1,167 @@
-# tex-manager: simplest working project plan
+# tex-manager: working notes for `texman`
 
-This repository is for a personal LaTeX file manager called `texman`. This file
-is the implementation plan; the application has not been built yet. The current
-change adds only this document. Implement the steps below in a future coding task.
+`texman` is a personal LaTeX file manager: a terminal catalog of the `.tex` and
+`.sty` files already on the machine, a description per file, Neovim as the
+editor, and a `:TexAI <line> <prompt>` command that inserts generated LaTeX.
 
-## What the first version must do
+**The plan in this file has been implemented.** Everything in
+"What the first version does" works and is verified as described under
+"Verifying changes". Read [ARCHITECTURE.md](ARCHITECTURE.md) before changing
+anything non-trivial; it explains the design decisions and the invariants below.
+[README.md](README.md) is the user-facing install and usage guide.
 
-1. Running `texman` opens a terminal UI and scans the computer for `.tex` and
-   `.sty` files. Show their containing directories and files in one searchable
+## What the first version does
+
+1. `texman` opens a terminal UI and scans the computer for `.tex` and `.sty`
+   files, showing their containing directories and files in one searchable
    catalog, grouped by directory.
-2. Let the user select a file, add or edit a description, see that description
-   in the terminal, and open the file in Neovim. Descriptions survive restarts
-   and rescans.
-3. While editing a TeX file in Neovim, let the user enter
-   `:TexAI <line> <prompt>` to insert generated LaTeX before that line.
-   For example: `:TexAI 25 Add a TikZ diagram of a three-node directed cycle`.
-4. Generate the snippet through the OpenAI API using the user's own API key.
-5. Keep everything suitable for one person's local use. No accounts, hosted
+2. The user can select a file, add or edit a description, see that description in
+   the terminal, and open the file in Neovim. Descriptions survive restarts and
+   rescans.
+3. While editing a TeX file in Neovim, `:TexAI <line> <prompt>` inserts generated
+   LaTeX before that line, for example
+   `:TexAI 25 Add a TikZ diagram of a three-node directed cycle`.
+4. Snippets are generated through the OpenAI API using the user's own API key.
+5. Everything is suitable for one person's local use. No accounts, hosted
    backend, synchronization, telemetry, or multi-user features.
 
 "One place" means a catalog of the original files. Do not move or copy them:
 relative `\input`, `\include`, images, and style references must keep working.
 
-## Smallest practical architecture
-
-Target macOS first, matching the initial development computer. Keep filesystem
-code portable to Linux, but defer Windows support and installer packaging.
-
-- Python 3.11+ for the application and command-line entry point.
-- `textual` for the terminal UI and `openai` for API requests. These are the only
-  direct runtime dependencies.
-- Standard-library `argparse`, `pathlib`/`os`, `sqlite3`, `json`, and `subprocess`
-  for everything else. Use `unittest` for focused automated checks.
-- A single Lua file for Neovim 0.10+ integration. Use Neovim's built-in process
-  and buffer APIs; no Python Neovim provider or plugin framework is needed.
-- One local SQLite database at
-  `${XDG_DATA_HOME:-~/.local/share}/texman/index.sqlite3`, outside this repository.
-- A normal Python console entry point: `texman = "texman.cli:main"`.
-
-Suggested files to create when implementation starts:
+## Layout
 
 ```text
-pyproject.toml             # package, dependencies, and texman entry point
+pyproject.toml            # setuptools package; texman = "texman.cli:main"
 texman/
-  __init__.py
-  cli.py                  # texman, texman scan, and internal texman ai command
+  __init__.py             # version only
+  cli.py                  # texman, texman scan, internal texman ai
   index.py                # filesystem traversal and SQLite persistence
-  tui.py                  # directory/file browser and description editor
+  tui.py, tui.tcss        # directory/file browser and description editor
   ai.py                   # request validation and OpenAI snippet generation
-nvim/
-  texman.lua              # :TexAI command
+nvim/texman.lua           # :TexAI command
 tests/
-  test_index.py
-  test_ai.py
-  test_nvim.lua
-README.md                 # installation and actual usage, written after it works
+  test_index.py           # walk + catalog, against a temporary fixture
+  test_ai.py              # request contract, with a stubbed client
+  test_tui.py             # headless Textual pilot, with nvim stubbed
+  test_cli.py             # the installed command, as a real subprocess
+  test_nvim.lua           # headless Neovim, with a fake texman on PATH
+ARCHITECTURE.md, README.md
 ```
 
-Do not add a server, daemon, filesystem watcher, ORM, vector database, agent
-framework, document parser, streaming protocol, or automatic LaTeX compiler.
-Manual refresh and one API request per prompt are enough.
+The catalog is one SQLite database at
+`${XDG_DATA_HOME:-~/.local/share}/texman/index.sqlite3`, outside this
+repository. `TEXMAN_DB` and `--db` point it elsewhere; tests always do.
 
-## Step 1: Make the command and local catalog work
+## Environment
 
-Create the Python package and a `pyproject.toml` using setuptools. Verify that
-installing the package exposes `texman` on `PATH`, regardless of the current
-working directory. Keep argument parsing separate from launching the TUI so
-`texman ai` never starts the UI or scans the computer.
+Target macOS first, matching the development machine. Keep filesystem code
+portable to Linux. Windows support and installer packaging are still deferred.
 
-Start with one SQLite table:
+- Python 3.11+; `textual` and `openai` are the only direct runtime dependencies.
+- Standard-library `argparse`, `pathlib`/`os`, `sqlite3`, `json`, and
+  `subprocess` for everything else; `unittest` for tests.
+- A single Lua file for Neovim 0.10+, using built-in process and buffer APIs. No
+  Python Neovim provider or plugin framework.
 
-```sql
-CREATE TABLE IF NOT EXISTS files (
-    path TEXT PRIMARY KEY,
-    parent_dir TEXT NOT NULL,
-    extension TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    last_seen TEXT NOT NULL
-);
+## Invariants to preserve
+
+These are the rules that keep the tool honest. Breaking one is a bug even if the
+tests still pass.
+
+- **A scan never overwrites a description.** The upsert's `ON CONFLICT` clause
+  updates discovery fields only. Descriptions commit as soon as they are saved.
+- **Rows are never deleted.** A missing file keeps its row and description and
+  displays as unavailable. A stopped or interrupted scan loses nothing.
+  Automatic deletion and rename tracking remain out of scope.
+- **Identities are absolute canonical paths**, extensions are matched
+  case-insensitively and stored lowercased, and all SQL is parameterized.
+- **Discovery reads metadata only** — no file contents, no network. The scan
+  root defaults to `/`.
+- **Only virtual and auto-mounting trees are excluded** (`/dev`, `/proc`, `/sys`,
+  `/net`, `/home`), and the summary names the ones that applied. Do not broadly
+  exclude system libraries, hidden folders, or caches: they contain TeX files.
+- **Traversal tolerates failure.** Directory symlinks are not followed, visited
+  device/inode pairs are remembered, permission errors and vanishing entries are
+  counted with representative paths, and the walk continues. Never require
+  `sudo` or change filesystem permissions. Report partial coverage honestly, and
+  mention Full Disk Access on macOS when paths were skipped.
+- **A stopped scan is incomplete, not successful** — in the summary text, in
+  `ScanStats.complete`, and in the CLI exit status.
+- **No overlapping scans.** One Textual thread worker at a time, cancelled
+  cooperatively between directories. SQLite connections stay owned by the thread
+  that created them; writes are batched in short transactions with a busy
+  timeout.
+- **Letter shortcuts never fire while a text input has focus.**
+- **The UI stays responsive on a whole-machine catalog.** Redraws during a scan
+  are paced by the last measured redraw cost (four times it, at least 0.5 s);
+  the directory list is rebuilt only when the directory set changed; saving a
+  description updates one table cell rather than redrawing. Message handlers
+  check `_widgets_ready`, because they also run before mount and during
+  teardown.
+- **Neovim is launched as an argument list**, never a shell string, with the
+  file's parent directory as the working directory, inside `App.suspend()`.
+- **`texman ai` never modifies a file.** It reads one JSON object on stdin,
+  writes only the snippet to stdout on success, and exits nonzero with a short
+  stderr message on invalid input, missing configuration, API failure, refusal,
+  incomplete response, or empty output.
+- **The client is constructed only for a generation request**, so browsing and
+  descriptions work with no API key, no network, and no `openai` import. Both
+  `OPENAI_API_KEY` and `TEXMAN_OPENAI_MODEL` come from the environment; the
+  model is an explicit ID, not a moving alias. One request, a 60-second timeout,
+  no automatic retries, explicit user retry.
+- **Context is bounded**: up to the first 100 lines, up to 40 lines each side of
+  the insertion point, overlap merged, omissions labelled, 24,000 characters
+  total, nearby text kept longest. Never read other indexed files or follow
+  `\input`. Buffer text is document context, not instructions.
+- **Never display or log the key or the full request body.**
+- **Neovim owns insertion.** `:TexAI` inserts *before* line `L`; valid values are
+  `1` through `N + 1`, where `N + 1` appends. The request captures the buffer
+  handle, its `changedtick`, and its in-memory lines; the scheduled callback
+  re-checks that the buffer is loaded, modifiable, and unchanged before a single
+  `nvim_buf_set_lines` call, so the insertion is one undo step and never lands on
+  a stale line. One active request per buffer, with the flag cleared on every
+  exit path. Nothing is saved automatically.
+- The only network operation is the explicitly requested AI generation. The
+  catalog and saved descriptions stay local.
+
+## Verifying changes
+
+```sh
+python -m unittest discover -s tests -t .       # 90 checks
+nvim --headless -u NONE -l tests/test_nvim.lua  # 58 checks
 ```
 
-Use absolute canonical paths as identities. Derive the directory list from
-distinct `parent_dir` values; a second directory table is unnecessary. Use
-parameterized SQL. Scan upserts update discovery fields but never overwrite
-`description`. Commit a description as soon as the user saves it.
+Automated tests use only a temporary fixture — never the developer's whole
+machine — and always stub the OpenAI client, so they make no paid API calls.
+The fixture covers nested files, hidden folders, duplicate filenames, spaces,
+an uppercase extension, a symlink loop, a broken link, and a permission failure.
+Note that `Custom.Sty` and `custom.sty` are the same file on macOS, so
+case-variant fixture names must live in different directories.
 
-For the first version, retain old records when a file disappears or a scan is
-interrupted. If opening a file fails, show it as unavailable and retain its
-description. Automatic deletion and tracking files across renames can wait.
+Manual checks, when touching the relevant area:
 
-## Step 2: Scan the entire accessible computer
+- A real scan from `/` stays responsive, reports inaccessible paths, and groups
+  files under their directories. Last measured: 42 s, 569,833 directories,
+  24,180 files, 557 skipped. With that catalog cached and a full scan running,
+  the UI's median event-loop tick stayed at 0.10 s with a 1.5 s worst-case
+  hiccup during a table rebuild.
+- `texman --help` works from a directory other than the repository.
+- A path containing spaces opens in Neovim and returns to the TUI.
+- File management works with both API variables unset.
+- One real `:TexAI` request with a configured key: the LaTeX appears at the
+  requested position, unrelated text stays intact, `u` undoes it, and the file
+  on disk changes only after `:write`. **Done** — verified against a live
+  project with `TEXMAN_OPENAI_MODEL=gpt-5.6-luna`; see the README. Mocked output
+  alone never proves API connectivity, so redo this check by hand if the request
+  path changes.
 
-The default scan root is `/`, not just the home directory or this repository.
-Visit normal mounted directories, including `/Volumes` on macOS, hidden
-directories, project folders, and installed TeX trees. Match `.tex` and `.sty`
-case-insensitively. Store each matching file and its immediate parent directory;
-the directory browser can display full paths without indexing every empty folder.
+## Do not add
 
-Implement a cancellable directory walk with these rules:
+No server, daemon, filesystem watcher, ORM, vector database, agent framework,
+document parser, streaming protocol, or automatic LaTeX compiler. Manual refresh
+and one API request per prompt are enough.
 
-- Inspect names and filesystem metadata only; discovery does not read file
-  contents or make API calls.
-- Do not follow directory symlinks. Track visited directory device/inode pairs
-  to avoid walking filesystem aliases twice, and canonicalize file paths to
-  avoid duplicate rows. Ignore broken links and non-regular file entries.
-- Skip virtual filesystem trees such as `/dev`, `/proc`, and `/sys`; do not
-  broadly exclude system libraries, hidden folders, or caches that might contain
-  TeX files. Report the excluded roots in the scan summary.
-- Catch permission errors and files/directories disappearing during traversal.
-  Continue scanning, count failures, and show representative skipped paths.
-  Never require `sudo` or change filesystem permissions.
-- "Entire computer" means files reachable on mounted filesystems with the
-  current user's permissions. Report partial coverage honestly. If macOS blocks
-  protected folders, explain that the user can grant their terminal Full Disk
-  Access and rescan; unmounted drives cannot be scanned.
-- Allow `texman scan --root <directory>` for a small test scan; omitting `--root`
-  uses `/`. Additional exclusion configuration can wait.
-
-On every `texman` launch, display cached results immediately and start one full
-scan in the background. On the first launch, show progress and populate results
-as batches arrive. Display current directory, file count, and skipped count.
-Provide a stop-scan action; stopping or quitting must preserve descriptions and
-already committed discoveries. A stopped scan is incomplete, not successful.
-
-Use a Textual thread worker for traversal, cooperative cancellation between
-directories, and messages to update the UI. Keep SQLite connections owned by
-their respective threads, use short transactions and a busy timeout, and batch
-discovery writes. Do not start overlapping scans. Follow the
-[Textual worker guidance](https://textual.textualize.io/guide/workers/).
-
-## Step 3: Build the terminal UI
-
-Use a directory list on the left and a file table on the right. Include an
-"All directories" choice; in that view, group files under parent-directory
-headings. Show filename, extension, and description in the table, with the
-selected file's full path and full description in a detail area.
-
-Support only these initial interactions:
-
-| Key | Action |
-| --- | --- |
-| Arrow keys and Tab | Move selection and switch panes |
-| `/` | Focus a case-insensitive substring filter over path and description |
-| Enter | Open the selected file in Neovim |
-| `d` | Edit the selected file's description in a small text dialog |
-| `r` | Start a full rescan if none is running |
-| `s` | Stop the current scan |
-| `q` | Quit |
-| Escape | Cancel a dialog or leave the filter |
-
-Apply letter shortcuts only when a text input is not focused. Saving a
-description refreshes the table immediately; cancelling leaves it unchanged.
-Include an empty-state message and visible key hints. Single-file selection is
-enough; defer bulk actions, tags, favorites, and file operations.
-
-Suspend the TUI while running `nvim` with the absolute file path as a separate
-argument, then restore the same selection after the editor exits. Set the
-editor's working directory to the file's parent directory. Avoid shell command
-strings so spaces and special characters in filenames work correctly. Explain
-how to install Neovim if it is unavailable. Textual provides
-[`App.suspend()`](https://textual.textualize.io/guide/app/#suspending) for handing
-the terminal to another application.
-
-## Step 4: Add a small OpenAI generation helper
-
-Implement an internal `texman ai` command with a deliberately small contract:
-
-- Read one JSON object from standard input with `line` (one-based integer),
-  `prompt` (nonempty string), and `buffer_lines` (array of strings).
-- On success, write only the generated LaTeX snippet to standard output and
-  exit with status 0. Diagnostics go to standard error.
-- On invalid input, missing configuration, API failure, refusal, incomplete
-  response, or empty output, return a nonzero status without snippet output.
-- Never modify a source file from Python. Neovim owns the actual insertion.
-
-Use the official Python SDK, `OpenAI()`, `client.responses.create(...)`, and
-`response.output_text`, as documented in the
-[OpenAI quickstart](https://developers.openai.com/api/docs/quickstart).
-Require `OPENAI_API_KEY` and `TEXMAN_OPENAI_MODEL` from the environment; the
-latter is an explicit text-generation model ID available to the user's API
-project. Keep model selection configurable instead of depending on a moving
-"latest" alias. Initialize the client only for an AI request so browsing and
-descriptions work without a key or internet connection.
-
-Build one request from the prompt, insertion position, and bounded context from
-the supplied current buffer. Include up to the first 100 lines for packages and
-macros and up to 40 lines on each side of the insertion point, deduplicating
-overlap and capping total context at 24,000 characters. Prioritize nearby text
-when truncating and label omitted sections. Do not read other indexed files or
-follow `\input` references automatically.
-
-In the request instructions, require a LaTeX fragment suitable for insertion:
-no Markdown fences, prose, repeated surrounding text, or full-document wrapper
-unless explicitly requested. Match surrounding conventions. For a diagram
-that needs a package absent from the provided context, include a brief LaTeX
-comment such as `% Requires \usepackage{tikz} in the preamble`; do not edit the
-preamble separately. Treat buffer text as document context, not instructions.
-
-Use a finite timeout (60 seconds), disable automatic retries for this first
-version, and allow the user to retry explicitly. Check completion/refusal before
-using the output; remove a single surrounding Markdown code fence if present,
-but otherwise preserve LaTeX whitespace and backslashes. Show short actionable
-errors for invalid keys, unavailable models, rate limits, and connection failures.
-Never display or log the key or full request body.
-
-The only network operation is the explicitly requested AI generation, which
-sends the prompt and selected buffer context to OpenAI. The catalog and saved
-descriptions remain local.
-
-## Step 5: Connect Neovim to the helper
-
-Use `:TexAI <line> <prompt>` instead of `/ai`: `/` already starts Neovim search,
-and user-defined Ex commands use an uppercase initial. Preserve normal search
-and existing mappings. If `TexAI` already exists, report the conflict and allow
-the Lua module's setup option to choose another uppercase command name.
-
-Implement the command in `nvim/texman.lua`:
-
-1. Register it with `nvim_create_user_command`. Parse the leading integer and
-   preserve the rest of the argument text, including spaces and backslashes, as
-   the prompt. Check that the current buffer is a modifiable TeX buffer.
-2. Define line semantics explicitly: insert **before** line `L`; valid values
-   are `1` through `N + 1` for an `N`-line buffer. `N + 1` appends. Reject invalid
-   lines and empty prompts before making an API call.
-3. Capture the original buffer handle, its changed tick, and its in-memory
-   lines, including unsaved edits. Allow only one active request per buffer.
-4. Call `vim.system` asynchronously with the argument list `{'texman', 'ai'}`
-   and JSON on stdin. Inherit the environment; never place the key or prompt
-   into a shell command. Notify the user that generation is in progress.
-5. Schedule the completion callback onto Neovim's main loop. On success, verify
-   that the original buffer is still loaded, modifiable, and unchanged since the
-   request. Switching windows is fine; insertion still targets the original
-   buffer. If it changed or closed, discard the result and explain that the user
-   should rerun the command. Do not insert at a stale line number.
-6. Split the complete output into lines and insert it with one
-   `nvim_buf_set_lines(buf, L - 1, L - 1, true, lines)` call. Keep it a single
-   undoable change, without saving the file automatically. The user can press
-   `u` to undo or use `:write` to save. On failure, leave the buffer unchanged
-   and display the helper's error. Clear the active-request flag on every exit.
-
-Use the documented [Neovim buffer and command APIs](https://neovim.io/doc/user/api/)
-and [Lua process API](https://neovim.io/doc/user/lua/#vim.system()). No persistent
-editor connection, background service, or temporary copy of the document is needed.
-
-## Step 6: Document personal setup and verify the complete workflow
-
-Once implemented, document these installation steps in the README:
-
-1. Install Python 3.11+, `pipx`, and Neovim 0.10+.
-2. From the repository, run `pipx install -e .`, then `pipx ensurepath`, and open
-   a new terminal. Check that `texman --help` works from another directory.
-3. For AI features, create an API key in the user's own OpenAI project, following
-   the [API key setup instructions](https://developers.openai.com/api/docs/quickstart#create-and-export-an-api-key).
-   Export the following in the shell used to launch Neovim, replacing both
-   placeholders. These variables are optional for file management:
-
-   ```sh
-   export OPENAI_API_KEY="<your-own-api-key>"
-   export TEXMAN_OPENAI_MODEL="<model-id-available-to-your-project>"
-   ```
-
-   If persisting these settings, use the user's local shell configuration, never
-   a tracked repository file. API usage is associated with the user's API account.
-4. Copy `nvim/texman.lua` to `stdpath('config')/lua/texman.lua` (normally
-   `~/.config/nvim/lua/texman.lua`) and add `require('texman').setup()` to the
-   existing `init.lua`. Create the `lua` directory if necessary; preserve the
-   user's other Neovim configuration.
-5. Run `texman`, select a file, add a description, open it, and try
-   `:TexAI 10 Add an aligned derivation of the quadratic formula` with a valid
-   line number for that buffer.
-
-Before calling the first version done, verify:
-
-- A temporary directory fixture containing nested `.tex` and `.sty` files,
-  hidden folders, duplicate filenames, spaces, uppercase extensions, and a
-  symlink loop scans correctly. Simulate permission failures where necessary.
-- Description edits persist after restarting and rescanning. A cancelled or
-  partial scan and an unavailable file do not remove descriptions.
-- A real full scan starts at `/`, stays responsive, reports inaccessible paths,
-  and displays matching files grouped under their directories. Use only the
-  temporary fixture in automated tests, never the developer's whole machine.
-- Selecting a path containing spaces launches Neovim correctly and returns to
-  the TUI. File management works with both API variables unset.
-- Mock the OpenAI client to check input validation, bounded context, raw snippet
-  output, and failure handling. Ordinary tests make no paid API calls.
-- Use a fake `texman ai` process in a headless Neovim check to cover insertion
-  before the first/middle line, append, invalid lines, unsaved context, one-step
-  undo, switched buffers, changed/closed buffers, and helper failure.
-- Perform one manual request with the user's configured key: generated LaTeX
-  appears at the requested position, unrelated text stays intact, undo works,
-  and disk contents change only when the user saves. Record this as unverified
-  if a key is unavailable; do not claim mocked output proves API connectivity.
-
-Deliver the catalog and descriptions first, then the helper, then the Neovim
-command. Stop expanding scope once this complete personal workflow works.
+Also deferred on purpose: bulk actions, tags, favorites, file operations,
+configurable scan exclusions, stale-row pruning, rename tracking, Windows
+support, and installer packaging. The complete personal workflow works; stop
+expanding scope.

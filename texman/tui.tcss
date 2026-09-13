@@ -1,0 +1,59 @@
+#body {
+    height: 1fr;
+}
+
+#directories {
+    width: 38;
+    border-right: solid $panel;
+}
+
+#right {
+    width: 1fr;
+}
+
+#filter {
+    border: round $accent;
+}
+
+#files {
+    height: 1fr;
+}
+
+#empty-state {
+    height: 1fr;
+    padding: 2 2;
+    color: $text-muted;
+}
+
+#detail {
+    height: 7;
+    border-top: solid $panel;
+    padding: 0 1;
+}
+
+#status {
+    height: 1;
+    background: $panel;
+    color: $text;
+    padding: 0 1;
+}
+
+DescriptionDialog {
+    align: center middle;
+}
+
+#dialog {
+    width: 70%;
+    height: auto;
+    padding: 1 2;
+    background: $surface;
+    border: round $accent;
+}
+
+#dialog-title {
+    text-style: bold;
+}
+
+#dialog-hint {
+    color: $text-muted;
+}

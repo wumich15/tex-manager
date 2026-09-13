@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "texman"
+version = "0.1.0"
+description = "Personal LaTeX file catalog with a terminal UI and an OpenAI snippet helper"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Michael Wu" }]
+dependencies = [
+    "textual>=0.60",
+    "openai>=1.40",
+]
+
+[project.scripts]
+texman = "texman.cli:main"
+
+[tool.setuptools]
+packages = ["texman"]
+
+[tool.setuptools.package-data]
+texman = ["*.tcss"]
