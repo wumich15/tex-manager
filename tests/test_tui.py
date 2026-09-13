@@ -21,6 +21,7 @@ from textual.widgets import DataTable, Input, OptionList, Static
 from texman import index
 from texman.tui import (
     ALL_DIRECTORIES,
+    display,
     DescriptionDialog,
     ScanFinished,
     ScanProgress,
@@ -505,6 +506,14 @@ class TeardownTests(TuiTestCase):
         # The worker's last messages can land after the app has stopped.
         app.on_scan_progress(ScanProgress(1, 1, 0, "/somewhere"))
         app.on_scan_finished(ScanFinished(stats=stats))
+
+
+class DisplayTests(unittest.TestCase):
+    def test_control_characters_are_replaced_for_table_cells(self) -> None:
+        self.assertEqual(display("two\nlines.tex"), "two\ufffdlines.tex")
+        self.assertEqual(display("tab\there"), "tab\ufffdhere")
+        self.assertEqual(display("ordinary name.tex"), "ordinary name.tex")
+        self.assertEqual(display("accentué.tex"), "accentué.tex")
 
 
 class NoApiDependencyTests(unittest.TestCase):

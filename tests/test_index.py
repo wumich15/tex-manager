@@ -256,6 +256,61 @@ class CatalogTests(unittest.TestCase):
         by_description = index.list_files(conn, query="macros")
         self.assertEqual([e.path for e in by_description], [str(self.files["sty"].resolve())])
 
+    def test_filter_treats_like_wildcards_as_literal_text(self) -> None:
+        """The filter is a substring match, so % and _ are not wildcards."""
+        for name in ("100%done.tex", "a_b.tex", "axb.tex"):
+            (self.root / "papers" / name).write_text("x")
+        self.scan()
+        conn = index.connect(self.db)
+        self.addCleanup(conn.close)
+        percent = index.list_files(conn, query="100%done")
+        self.assertEqual([e.name for e in percent], ["100%done.tex"])
+        underscore = index.list_files(conn, query="a_b.tex")
+        self.assertEqual([e.name for e in underscore], ["a_b.tex"])
+        # A lone % must not match everything.
+        self.assertEqual(
+            [e.name for e in index.list_files(conn, query="%")], ["100%done.tex"]
+        )
+        # A backslash is literal too, and must not break the ESCAPE clause.
+        self.assertEqual(index.list_files(conn, query="\\"), [])
+
+    def test_path_that_is_not_valid_utf8_is_skipped_not_fatal(self) -> None:
+        """SQL text must be UTF-8; a surrogate path would crash the scan."""
+        real = os.path.realpath
+        target = str(self.files["main"].resolve())
+
+        def surrogate(path: str) -> str:
+            resolved = real(path)
+            return resolved + "\udcff" if resolved == target else resolved
+
+        stats = index.ScanStats()
+        with unittest.mock.patch("os.path.realpath", surrogate):
+            found = [r.path for r in index.walk_tree(self.root, stats)]
+        self.assertNotIn(target + "\udcff", found)
+        self.assertGreaterEqual(stats.skipped, 1)
+        # The rest of the tree is still catalogued.
+        self.assertIn(str(self.files["sty"].resolve()), found)
+
+    def test_concurrent_connections_to_a_new_catalog_all_succeed(self) -> None:
+        """`PRAGMA journal_mode = WAL` ignores busy_timeout and can fail."""
+        import threading
+
+        db = self.root / "contended.sqlite3"
+        failures: list[str] = []
+
+        def open_and_close() -> None:
+            try:
+                index.connect(db).close()
+            except Exception as exc:  # pragma: no cover - the old bug
+                failures.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=open_and_close) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(failures, [])
+
     def test_directory_filter_restricts_results(self) -> None:
         self.scan()
         conn = index.connect(self.db)

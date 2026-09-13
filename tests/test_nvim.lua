@@ -33,6 +33,15 @@ SNIPPET
   fenced)
     printf '%s\n' '```latex' '\beta' '```'
     ;;
+  fixed)
+    printf '%s\n' 'Corrected \emph{line} from the helper.'
+    ;;
+  fixed_multi)
+    printf '%s\n' 'First corrected line.' '\end{equation}'
+    ;;
+  unchanged)
+    printf '%s\n' 'Blamed line.'
+    ;;
   slow)
     sleep 1
     printf '%s\n' '\alpha'
@@ -103,6 +112,23 @@ local function new_tex_buffer(lines, opts)
   vim.bo[buf].filetype = opts.filetype or 'tex'
   vim.api.nvim_buf_set_lines(buf, 0, -1, true, lines)
   return buf
+end
+
+--- Write `lines` to a real file and edit it, so the buffer is not modified.
+local function open_saved_file(name, lines)
+  local path = tmp .. '/' .. name
+  vim.fn.writefile(lines, path)
+  vim.cmd('edit! ' .. vim.fn.fnameescape(path))
+  local buf = vim.api.nvim_get_current_buf()
+  vim.bo[buf].filetype = 'tex'
+  return buf, path
+end
+
+--- Write a log next to `path`, in the shape latexmk -file-line-error produces.
+local function write_log(path, body)
+  local log = (path:gsub('%.tex$', '.log'))
+  vim.fn.writefile(body, log)
+  return log
 end
 
 local texman = dofile(module_path)
@@ -359,6 +385,283 @@ do
     vim.api.nvim_buf_get_lines(buf, 0, -1, true), sample)
   vim.env.PATH = saved
 end
+
+-- ------------------------------------------------------------- :TexAIFix
+
+ok('fix command registered', vim.api.nvim_get_commands({})['TexAIFix'] ~= nil)
+eq('fix command name recorded', texman.fix_command_name, 'TexAIFix')
+
+local blamed = {
+  '\\documentclass{article}',
+  '\\begin{document}',
+  'Blamed line.',
+  '\\end{document}',
+}
+
+local function error_log(file, line, message)
+  return {
+    'This is pdfTeX, Version 3.141592653',
+    'LaTeX Font Info:    Checking defaults on input line 4.',
+    '',
+    './' .. file .. ':' .. line .. ': ' .. message,
+    'l.' .. line .. ' Blamed line.',
+    'The control sequence at the end of the top line',
+    'Output written on doc.pdf (1 page).',
+  }
+end
+
+do
+  vim.env.TEXMAN_FAKE_MODE = 'fixed'
+  local buf, path = open_saved_file('fix1.tex', blamed)
+  write_log(path, error_log('fix1.tex', 3, 'Undefined control sequence.'))
+  vim.fn.delete(capture)
+  vim.env.TEXMAN_FAKE_CAPTURE = capture
+  notes = {}
+  texman.fix('')
+  ok('progress names the blamed line', string.match(last_note(), 'fixing line 3') ~= nil, last_note())
+  ok('fix completes', wait_for('replaced line 3'), last_note())
+  vim.env.TEXMAN_FAKE_CAPTURE = nil
+  eq('the blamed line was replaced', vim.api.nvim_buf_get_lines(buf, 0, -1, true), {
+    blamed[1], blamed[2], 'Corrected \\emph{line} from the helper.', blamed[4],
+  })
+  local payload = vim.json.decode(table.concat(vim.fn.readfile(capture), '\n'))
+  eq('mode is fix', payload.mode, 'fix')
+  eq('the blamed line number is sent', payload.line, 3)
+  ok('the compiler message is the prompt',
+    string.match(payload.prompt, 'Undefined control sequence') ~= nil, payload.prompt)
+  ok('the log is sent', string.match(payload.log_text, 'fix1%.tex:3:') ~= nil)
+  ok('the buffer lines are sent', #payload.buffer_lines == 4)
+  -- One undo must put the original line back.
+  vim.api.nvim_set_current_buf(buf)
+  vim.cmd('silent undo')
+  eq('one undo restores the blamed line', vim.api.nvim_buf_get_lines(buf, 0, -1, true), blamed)
+  ok('the file on disk is untouched until :write', vim.deep_equal(vim.fn.readfile(path), blamed))
+end
+
+do
+  vim.env.TEXMAN_FAKE_MODE = 'fixed_multi'
+  local buf, path = open_saved_file('fix2.tex', blamed)
+  write_log(path, error_log('fix2.tex', 3, 'Missing \\end{equation} inserted.'))
+  notes = {}
+  texman.fix('')
+  ok('multi-line replacement completes', wait_for('replaced line 3 with 2 line'), last_note())
+  eq('replacement can add lines', vim.api.nvim_buf_get_lines(buf, 0, -1, true), {
+    blamed[1], blamed[2], 'First corrected line.', '\\end{equation}', blamed[4],
+  })
+end
+
+do
+  vim.env.TEXMAN_FAKE_MODE = 'unchanged'
+  local buf, path = open_saved_file('fix3.tex', blamed)
+  write_log(path, error_log('fix3.tex', 3, 'Undefined control sequence.'))
+  notes = {}
+  texman.fix('')
+  ok('an unchanged answer is reported', wait_for('already looks correct'), last_note())
+  eq('buffer untouched when nothing changed',
+    vim.api.nvim_buf_get_lines(buf, 0, -1, true), blamed)
+end
+
+do
+  vim.env.TEXMAN_FAKE_MODE = 'fixed'
+  local buf, path = open_saved_file('fix4.tex', blamed)
+  write_log(path, error_log('fix4.tex', 3, 'Undefined control sequence.'))
+  vim.fn.delete(capture)
+  vim.env.TEXMAN_FAKE_CAPTURE = capture
+  notes = {}
+  texman.fix('prefer \\textbf over \\bf')
+  ok('extra guidance still fixes', wait_for('replaced line 3'), last_note())
+  vim.env.TEXMAN_FAKE_CAPTURE = nil
+  local payload = vim.json.decode(table.concat(vim.fn.readfile(capture), '\n'))
+  ok('extra guidance reaches the prompt',
+    string.find(payload.prompt, 'Additional guidance', 1, true) ~= nil
+      and string.find(payload.prompt, 'textbf over', 1, true) ~= nil, payload.prompt)
+end
+
+do
+  -- An unsaved buffer must be refused: log line numbers describe the disk file.
+  local buf, path = open_saved_file('fix5.tex', blamed)
+  write_log(path, error_log('fix5.tex', 3, 'Undefined control sequence.'))
+  vim.api.nvim_buf_set_lines(buf, 0, 0, true, { '% a new unsaved line' })
+  vim.fn.delete(capture)
+  vim.env.TEXMAN_FAKE_CAPTURE = capture
+  notes = {}
+  texman.fix('')
+  vim.wait(200)
+  vim.env.TEXMAN_FAKE_CAPTURE = nil
+  ok('modified buffer is refused', string.match(last_note(), 'save the buffer') ~= nil, last_note())
+  ok('no helper call for a modified buffer', vim.fn.filereadable(capture) == 0)
+  vim.cmd('silent edit!')
+end
+
+do
+  local buf, path = open_saved_file('fix6.tex', blamed)
+  -- No log at all.
+  notes = {}
+  texman.fix('')
+  vim.wait(200)
+  ok('missing log is reported', string.match(last_note(), 'no compiler log found') ~= nil, last_note())
+  ok('missing log names where it looked', string.match(last_note(), 'fix6%.log') ~= nil, last_note())
+  eq('buffer unchanged without a log', vim.api.nvim_buf_get_lines(buf, 0, -1, true), blamed)
+end
+
+do
+  local buf, path = open_saved_file('fix7.tex', blamed)
+  write_log(path, {
+    'This is pdfTeX, Version 3.141592653',
+    'Output written on doc.pdf (1 page).',
+  })
+  notes = {}
+  texman.fix('')
+  vim.wait(200)
+  ok('a clean log says so', string.match(last_note(), 'no errors for this buffer') ~= nil, last_note())
+  eq('buffer unchanged for a clean log',
+    vim.api.nvim_buf_get_lines(buf, 0, -1, true), blamed)
+end
+
+do
+  -- The first error belongs to another file: never edit this buffer blindly.
+  local buf, path = open_saved_file('fix8.tex', blamed)
+  write_log(path, error_log('chapter-two.tex', 12, 'Undefined control sequence.'))
+  vim.fn.delete(capture)
+  vim.env.TEXMAN_FAKE_CAPTURE = capture
+  notes = {}
+  texman.fix('')
+  vim.wait(200)
+  vim.env.TEXMAN_FAKE_CAPTURE = nil
+  ok('an error in another file is reported',
+    string.match(last_note(), 'chapter%-two%.tex') ~= nil, last_note())
+  ok('no helper call for another file\'s error', vim.fn.filereadable(capture) == 0)
+  eq('buffer unchanged for another file\'s error',
+    vim.api.nvim_buf_get_lines(buf, 0, -1, true), blamed)
+end
+
+do
+  -- A log blaming a line past the end of the buffer must not be applied.
+  local buf, path = open_saved_file('fix9.tex', blamed)
+  write_log(path, error_log('fix9.tex', 99, 'Undefined control sequence.'))
+  notes = {}
+  texman.fix('')
+  vim.wait(200)
+  ok('an out-of-range log line is refused',
+    string.match(last_note(), 'blames line 99') ~= nil, last_note())
+  eq('buffer unchanged for an out-of-range line',
+    vim.api.nvim_buf_get_lines(buf, 0, -1, true), blamed)
+end
+
+do
+  -- Without -file-line-error TeX names no file; the classic form is assumed.
+  vim.env.TEXMAN_FAKE_MODE = 'fixed'
+  local buf, path = open_saved_file('fix10.tex', blamed)
+  write_log(path, {
+    'This is pdfTeX, Version 3.141592653',
+    '! Undefined control sequence.',
+    'l.3 Blamed line.',
+    'The control sequence at the end of the top line',
+  })
+  notes = {}
+  texman.fix('')
+  ok('classic log form is used', wait_for('replaced line 3'), last_note())
+  ok('the assumption is stated', string.match(table.concat(
+    vim.tbl_map(function(n) return n.message end, notes), ' '), 'assuming this one') ~= nil)
+end
+
+do
+  -- An unclosed environment names its line in prose, not as l.<n>.
+  vim.env.TEXMAN_FAKE_MODE = 'fixed'
+  local buf, path = open_saved_file('fix11.tex', blamed)
+  write_log(path, {
+    'This is pdfTeX, Version 3.141592653',
+    '! LaTeX Error: \\begin{equation} on input line 3 ended by \\end{document}.',
+    'See the LaTeX manual or LaTeX Companion for explanation.',
+  })
+  notes = {}
+  texman.fix('')
+  ok('an "on input line" error is used', wait_for('replaced line 3'), last_note())
+  eq('the named line was replaced', vim.api.nvim_buf_get_lines(buf, 2, 3, true),
+    { 'Corrected \\emph{line} from the helper.' })
+end
+
+do
+  -- A runaway argument names no line at all; find it by the echoed source.
+  vim.env.TEXMAN_FAKE_MODE = 'fixed'
+  local runaway_doc = {
+    '\\documentclass{article}',
+    '\\begin{document}',
+    '\\[',
+    '  x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}{2a}',
+    '\\]',
+    '\\end{document}',
+  }
+  local buf, path = open_saved_file('fix12.tex', runaway_doc)
+  write_log(path, {
+    'This is pdfTeX, Version 3.141592653',
+    'Runaway argument?',
+    '{-b \\pm \\sqrt {b^2 - 4ac}{2a} \\]',
+    '! File ended while scanning use of \\frac .',
+    '<inserted text>',
+    '                \\par',
+    '<*> fix12.tex',
+    '!  ==> Fatal error occurred, no output PDF file produced!',
+  })
+  notes = {}
+  texman.fix('')
+  ok('a runaway argument is located by its text', wait_for('replaced line 4'), last_note())
+  eq('the runaway line was replaced', vim.api.nvim_buf_get_lines(buf, 3, 4, true),
+    { 'Corrected \\emph{line} from the helper.' })
+  eq('other lines untouched', vim.api.nvim_buf_get_lines(buf, 0, 3, true),
+    { runaway_doc[1], runaway_doc[2], runaway_doc[3] })
+end
+
+do
+  -- A fatal error with nothing locatable must be reported, not called clean.
+  local buf, path = open_saved_file('fix13.tex', blamed)
+  write_log(path, {
+    'This is pdfTeX, Version 3.141592653',
+    '! Emergency stop.',
+    '<*> fix13.tex',
+    '!  ==> Fatal error occurred, no output PDF file produced!',
+  })
+  vim.fn.delete(capture)
+  vim.env.TEXMAN_FAKE_CAPTURE = capture
+  notes = {}
+  texman.fix('')
+  vim.wait(200)
+  vim.env.TEXMAN_FAKE_CAPTURE = nil
+  ok('an unattributable failure is reported honestly',
+    string.match(last_note(), 'names no line') ~= nil, last_note())
+  ok('the failure message is shown',
+    string.match(last_note(), 'Emergency stop') ~= nil, last_note())
+  ok('no helper call without a line', vim.fn.filereadable(capture) == 0)
+  eq('buffer unchanged for an unattributable failure',
+    vim.api.nvim_buf_get_lines(buf, 0, -1, true), blamed)
+end
+
+do
+  -- A short runaway must not be matched loosely against the buffer.
+  local buf, path = open_saved_file('fix14.tex', blamed)
+  write_log(path, {
+    'Runaway argument?',
+    '{x}',
+    '! File ended while scanning use of \\foo .',
+  })
+  notes = {}
+  texman.fix('')
+  vim.wait(200)
+  ok('a too-short runaway is not guessed at',
+    string.match(last_note(), 'names no line') ~= nil, last_note())
+  eq('buffer unchanged for a short runaway',
+    vim.api.nvim_buf_get_lines(buf, 0, -1, true), blamed)
+end
+
+do
+  local buf = new_tex_buffer(blamed, { filetype = 'markdown', extension = '.md' })
+  notes = {}
+  texman.fix('')
+  vim.wait(150)
+  ok('fix refuses a non-TeX buffer', string.match(last_note(), 'not a TeX buffer') ~= nil, last_note())
+end
+
+vim.env.TEXMAN_FAKE_MODE = 'ok'
 
 -- ------------------------------------------------------------------ summary
 

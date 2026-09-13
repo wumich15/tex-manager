@@ -38,6 +38,18 @@ from . import index
 ALL_DIRECTORIES = "\0all"
 HEADING_PREFIX = "\0dir:"
 
+def display(text: str) -> str:
+    """Make a name or description safe for a single-line table cell.
+
+    File names may legally contain newlines and other control characters; the
+    full, unaltered path is still what gets opened and shown in the detail area.
+    """
+    return "".join(
+        character if character.isprintable() or character == " " else "\ufffd"
+        for character in text
+    )
+
+
 NVIM_MISSING = (
     "Neovim was not found on PATH. Install it with `brew install neovim` "
     "(macOS) or your package manager, then try again."
@@ -233,13 +245,16 @@ class TexmanApp(App[None]):
                 current_group = entry.parent_dir
                 key = f"{HEADING_PREFIX}{current_group}"
                 table.add_row(
-                    Text(current_group, style="bold"), Text(""), Text(""), key=key
+                    Text(display(current_group), style="bold"),
+                    Text(""),
+                    Text(""),
+                    key=key,
                 )
                 self._row_order.append(key)
             table.add_row(
-                entry.name,
+                display(entry.name),
                 entry.extension.lstrip("."),
-                entry.description or Text("—", style="dim"),
+                display(entry.description) or Text("—", style="dim"),
                 key=entry.path,
             )
             self._row_order.append(entry.path)
@@ -534,7 +549,9 @@ class TexmanApp(App[None]):
                 return
             self._update_description_cell(path, description)
 
-        self.push_screen(DescriptionDialog(entry.name, entry.description), save)
+        self.push_screen(
+            DescriptionDialog(display(entry.name), entry.description), save
+        )
 
     def _update_description_cell(self, path: str, description: str) -> None:
         """Show a saved description at once, without redrawing the table."""
@@ -546,7 +563,7 @@ class TexmanApp(App[None]):
         table = self.query_one("#files", DataTable)
         try:
             table.update_cell(
-                path, "description", description or Text("—", style="dim")
+                path, "description", display(description) or Text("—", style="dim")
             )
         except CellDoesNotExist:  # pragma: no cover - the row was just rebuilt
             self.reload_catalog(keep_path=path)

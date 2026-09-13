@@ -25,6 +25,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for how it works internally.
   to the same place in the catalog.
 - `:TexAI 25 Add a TikZ diagram of a three-node directed cycle` inserts
   generated LaTeX before line 25 of the buffer you are editing.
+- `:TexAIFix` reads your compiler's log, finds the line LaTeX complained about,
+  and replaces it with a corrected version.
 
 ## Requirements
 
@@ -177,6 +179,49 @@ first 100 lines for packages and macros, and up to 40 lines on each side of the
 insertion point. No other file in your catalog is read, and `\input` references
 are not followed.
 
+## Fixing a compile error
+
+Compile the document first — with vimtex that is `\ll` — then, in the buffer that
+failed:
+
+```vim
+:TexAIFix
+```
+
+It reads the compiler's log, finds the first error blamed on *this* file, and
+replaces that one line with a corrected version. You can add guidance:
+
+```vim
+:TexAIFix prefer \dfrac here
+```
+
+It finds the log the way your setup writes it: from vimtex's own build
+information when vimtex is loaded, otherwise `<name>.log`, `build/<name>.log`, or
+`out/<name>.log` beside the file.
+
+LaTeX reports errors in several shapes, and all four are understood:
+
+| What the log says | How the line is found |
+| --- | --- |
+| `./thesis.tex:25: Undefined control sequence.` | directly (vimtex passes `-file-line-error`) |
+| `! Undefined control sequence.` then `l.25` | from the `l.25` marker |
+| `! LaTeX Error: \begin{equation} on input line 6 ended by …` | from the line named in the message |
+| `Runaway argument?` then `! File ended while scanning …` | by matching the source TeX echoed back — this is the usual shape of an unclosed brace, and the log names no line at all |
+
+The rules are deliberately careful, because a wrong edit is worse than no edit:
+
+- **The buffer must be saved.** Log line numbers describe the file on disk, so
+  `:TexAIFix` refuses to work from an unsaved buffer rather than trust a stale
+  line number. Save, recompile, then run it.
+- **Only this file.** If the first error is in another file, it says which one and
+  changes nothing; open that file and run the command there.
+- **Only one line.** The blamed line is replaced, possibly by several lines when
+  the fix needs them (a missing `\end{...}`, say). Nothing else is touched.
+- **Never silently clean.** If the compile failed but the log names no line and
+  nothing can be located, it says so and makes no edit — it will not tell you
+  there are no errors when the build died.
+- One undo step, and nothing is written to disk until you `:write`.
+
 ## Try the whole workflow
 
 1. Run `texman` and wait for files to appear.
@@ -220,3 +265,12 @@ One real `:TexAI` request against a live OpenAI project, with
 - A single `u` removed the whole snippet and kept the unsaved edit.
 - A second request in the same buffer worked, so the per-buffer request flag
   clears correctly.
+
+`:TexAIFix` was verified against two real `latexmk` failures:
+
+- An undefined control sequence (`./broken.tex:7: Undefined control sequence.`)
+  was located from the log and the offending macro removed from line 7 only.
+- An unclosed brace in `\frac{-b \pm \sqrt{b^2 - 4ac}{2a}`, which LaTeX reports
+  as a fatal `File ended while scanning use of \frac` with **no line number**,
+  was located through the runaway-argument text. The fix added the one missing
+  brace, and the document then compiled to a PDF with no errors.

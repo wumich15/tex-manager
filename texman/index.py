@@ -72,10 +72,28 @@ def connect(db_path: str | os.PathLike[str] | None = None) -> sqlite3.Connection
     conn = sqlite3.connect(str(path), timeout=BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
-    conn.execute("PRAGMA journal_mode = WAL")
+    _enable_wal(conn)
     conn.executescript(SCHEMA)
     conn.commit()
     return conn
+
+
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """Switch to WAL if it is not already on, tolerating a concurrent switch.
+
+    Unlike ordinary statements, `PRAGMA journal_mode = WAL` does not honour
+    `busy_timeout`: it needs an exclusive lock and fails immediately if another
+    connection is converting the same new file. The mode is a property of the
+    file, so whoever wins sets it for everyone, and the default journal is
+    correct in the meantime -- a loss here must not fail the caller.
+    """
+    mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    if str(mode).lower() == "wal":
+        return
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -244,6 +262,15 @@ def walk_tree(
                         if not entry.is_file(follow_symlinks=True):
                             continue
                         canonical = os.path.realpath(entry.path)
+                        try:
+                            # A name that is not valid UTF-8 (possible on Linux)
+                            # cannot be stored as SQL text; count it honestly
+                            # instead of failing the scan.
+                            canonical.encode("utf-8")
+                        except UnicodeEncodeError:
+                            stats.note_skip(entry.path.encode(
+                                "utf-8", "replace").decode("utf-8"))
+                            continue
                         if canonical in seen_files:
                             continue
                         seen_files.add(canonical)
@@ -307,6 +334,19 @@ def set_description(conn: sqlite3.Connection, path: str, description: str) -> bo
 # Reads
 # --------------------------------------------------------------------------
 
+LIKE_ESCAPE = "\\"
+
+
+def _like_pattern(query: str) -> str:
+    """Build a LIKE pattern matching `query` as a literal substring."""
+    escaped = (
+        query.replace(LIKE_ESCAPE, LIKE_ESCAPE * 2)
+        .replace("%", LIKE_ESCAPE + "%")
+        .replace("_", LIKE_ESCAPE + "_")
+    )
+    return f"%{escaped}%"
+
+
 def _entry(row: sqlite3.Row) -> CatalogEntry:
     return CatalogEntry(
         path=row["path"],
@@ -343,8 +383,11 @@ def list_files(
         clauses.append("parent_dir = ?")
         params.append(parent_dir)
     if query:
-        clauses.append("(path LIKE ? COLLATE NOCASE OR description LIKE ? COLLATE NOCASE)")
-        like = f"%{query}%"
+        clauses.append(
+            f"(path LIKE ? ESCAPE '{LIKE_ESCAPE}' COLLATE NOCASE"
+            f" OR description LIKE ? ESCAPE '{LIKE_ESCAPE}' COLLATE NOCASE)"
+        )
+        like = _like_pattern(query)
         params.extend([like, like])
     if clauses:
         sql.append("WHERE " + " AND ".join(clauses))

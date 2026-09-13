@@ -16,7 +16,7 @@ texman/cli.py     argparse front door: texman, texman scan, texman ai
 texman/index.py   directory walk + SQLite persistence (no UI, no network)
 texman/tui.py     Textual browser, description editor, scan worker
 texman/ai.py      JSON-in/LaTeX-out OpenAI helper (the only network code)
-nvim/texman.lua   :TexAI <line> <prompt>; owns all buffer modification
+nvim/texman.lua   :TexAI and :TexAIFix; owns all buffer modification
 ```
 
 Dependencies point one way: `cli` imports the others lazily, `tui` imports
@@ -198,8 +198,24 @@ messages for bad keys, unavailable models, rate limits, timeouts, and connection
 failures. Error text is derived from the exception type, never from the key or
 the request body.
 
+Fix mode swaps in a second set of instructions: repair the one blamed line,
+change as little as possible, return the line unchanged if the log does not
+actually implicate it. The request body quotes the failing line verbatim, adds a
+bounded excerpt of the compiler log, and marks that line in the document context
+rather than marking an insertion point.
+
+A LaTeX log is mostly font and package chatter, so `extract_log_excerpt` keeps
+only lines matching error markers -- `!`, `file:line:`, `l.<n>`, `LaTeX Error:`,
+`Emergency stop`, `Runaway argument`, `<inserted text>` -- plus six lines after
+each, which is where TeX echoes the offending source. Warnings are added only if
+the result is still under 6,000 characters; when it is not, warnings go first and
+then the latest errors, because in TeX the earliest error is the real one.
+Omitted stretches are labelled. A real 6,735-character log reduces to about
+1,550 characters this way.
+
 Generation is the only network operation in the program, and it sends only the
-prompt and the bounded buffer context. The catalog and descriptions stay local.
+prompt, the bounded buffer context, and (for a fix) the bounded log excerpt. The
+catalog and descriptions stay local.
 
 ## Neovim integration
 
@@ -225,8 +241,30 @@ rerun — a stale line number is never used. Switching windows in the meantime i
 fine, because insertion targets the captured handle rather than the current
 buffer.
 
+`:TexAIFix` reuses all of that plumbing and adds the log work. It locates the log
+from vimtex's own `b:vimtex.root` and `b:vimtex.compiler.file_info.jobname`
+(honouring `out_dir`) when vimtex is loaded, and otherwise tries `<stem>.log`,
+`build/<stem>.log`, and `out/<stem>.log` beside the file.
+
+`scan_log` then finds the first error, trying four log shapes in order of how
+precisely they name a line: `file:line: message` (from `-file-line-error`, which
+vimtex passes); `! message` followed by `l.<n>`; `! message` mentioning `on input
+line <n>`, as an unclosed environment does; and finally an unattributed fatal
+error located through the `Runaway argument?` text, which is how an unclosed
+brace usually appears -- TeX names no line there, but it does echo the source it
+swallowed, so the line is found by comparing with whitespace removed. The last
+three name no file, so they are only trusted when the log blames no file
+anywhere; if the first error belongs to another file, the command says which and
+edits nothing.
+
+Three refusals keep a wrong edit from happening. The buffer must be saved,
+because log line numbers describe the file on disk. The blamed line must exist in
+the buffer. And when the compile failed but nothing can be located, the command
+reports the failure instead of claiming the log is clean -- a silent "no errors"
+on a build that produced no PDF would be the worst outcome.
+
 Insertion is one `nvim_buf_set_lines(buf, L - 1, L - 1, true, lines)` call, so it
-is a single undoable change. Writing `undolevels` back to itself immediately
+is a single undoable change; a fix is the same call over `L - 1` to `L`. Writing `undolevels` back to itself immediately
 before that call syncs undo, which keeps the insertion from merging into the
 user's previous edit: one `u` removes the snippet and nothing else. The file is
 never saved automatically.

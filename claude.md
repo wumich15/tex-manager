@@ -21,6 +21,9 @@ anything non-trivial; it explains the design decisions and the invariants below.
 3. While editing a TeX file in Neovim, `:TexAI <line> <prompt>` inserts generated
    LaTeX before that line, for example
    `:TexAI 25 Add a TikZ diagram of a three-node directed cycle`.
+   `:TexAIFix` reads the compiler log, finds the line LaTeX blamed, and replaces
+   it with a corrected version. This was added after the first version shipped,
+   at the user's request; it is part of the intended scope now.
 4. Snippets are generated through the OpenAI API using the user's own API key.
 5. Everything is suitable for one person's local use. No accounts, hosted
    backend, synchronization, telemetry, or multi-user features.
@@ -125,6 +128,20 @@ tests still pass.
   total, nearby text kept longest. Never read other indexed files or follow
   `\input`. Buffer text is document context, not instructions.
 - **Never display or log the key or the full request body.**
+- **`:TexAIFix` must never make a wrong edit.** It refuses an unsaved buffer,
+  because log line numbers describe the file on disk. It refuses when the first
+  error belongs to another file, naming that file. It refuses a blamed line
+  outside the buffer. When a compile failed but no line can be located, it
+  reports the failure rather than claiming the log is clean -- a silent "no
+  errors" on a build that produced no PDF is the worst possible outcome. It
+  replaces exactly the blamed line, in one undoable change, and saves nothing.
+- **All four LaTeX error shapes are handled**, in order of precision:
+  `file:line: message` (from `-file-line-error`, which vimtex passes), `!
+  message` plus `l.<n>`, `! message` mentioning `on input line <n>`, and an
+  unattributed fatal error located through the `Runaway argument?` text that TeX
+  echoes back. The last three name no file, so trust them only when the log
+  blames no file anywhere. Do not loosen the eight-character minimum on runaway
+  matching: a short echo would match the wrong line.
 - **Neovim owns insertion.** `:TexAI` inserts *before* line `L`; valid values are
   `1` through `N + 1`, where `N + 1` appends. The request captures the buffer
   handle, its `changedtick`, and its in-memory lines; the scheduled callback
@@ -138,8 +155,8 @@ tests still pass.
 ## Verifying changes
 
 ```sh
-python -m unittest discover -s tests -t .       # 101 checks
-nvim --headless -u NONE -l tests/test_nvim.lua  # 58 checks
+python -m unittest discover -s tests -t .       # 127 checks
+nvim --headless -u NONE -l tests/test_nvim.lua  # 107 checks
 ```
 
 Automated tests use only a temporary fixture — never the developer's whole
@@ -170,9 +187,11 @@ Manual checks, when touching the relevant area:
 
 No server, daemon, filesystem watcher, ORM, vector database, agent framework,
 document parser, streaming protocol, or automatic LaTeX compiler. Manual refresh
-and one API request per prompt are enough.
+and one API request per prompt are enough. `:TexAIFix` *reads* a log the user's
+own compiler already produced; it never runs the compiler itself.
 
 Also deferred on purpose: bulk actions, tags, favorites, file operations,
 configurable scan exclusions, stale-row pruning, rename tracking, Windows
-support, and installer packaging. The complete personal workflow works; stop
-expanding scope.
+support, and installer packaging. `:TexAIFix` fixes one line from one error; it
+does not iterate, recompile, or repair a whole document. The complete personal
+workflow works; do not expand scope further without being asked.
