@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,30 @@ from texman.tui import (
 from tests.test_index import build_fixture
 
 
+class TrackedSuspend:
+    """Stands in for `App.suspend()`, recording how the block was left.
+
+    The real `App.suspend()` resumes application mode after its body, but not if
+    the body raises — an exception that escapes leaves the terminal unusable, so
+    tests assert that none does.
+    """
+
+    def __init__(self) -> None:
+        self.entered = 0
+        self.escaped: BaseException | None = None
+
+    def __call__(self):
+        return self
+
+    def __enter__(self):
+        self.entered += 1
+        return None
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.escaped = exc
+        return False
+
+
 class TuiTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -37,8 +62,9 @@ class TuiTestCase(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.tmp.cleanup)
         index.run_scan(self.root, db_path=self.db)
         # `suspend()` needs a real terminal; the headless driver has none.
+        self.suspend = TrackedSuspend()
         patcher = mock.patch.object(
-            TexmanApp, "suspend", lambda self: contextlib.nullcontext()
+            TexmanApp, "suspend", lambda app: self.suspend()
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -178,14 +204,17 @@ class FilterTests(TuiTestCase):
             self.assertTrue(app.query_one("#files", DataTable).has_focus)
             self.assertEqual(app._filter, "thesis")
 
-    async def test_no_match_shows_a_hint(self) -> None:
+    async def test_no_match_hint_describes_what_actually_works(self) -> None:
         app = self.app()
         async with app.run_test() as pilot:
             await pilot.pause()
             await pilot.press("slash")
             app.query_one("#filter", Input).value = "zzzz-nothing"
             await pilot.pause()
-            self.assertIn("Nothing matches", self.static_text(app, "#empty-state"))
+            hint = self.static_text(app, "#empty-state")
+            self.assertIn("Nothing matches", hint)
+            # Escape leaves the filter; it does not clear it, so don't say so.
+            self.assertNotIn("Escape", hint)
 
 
 class DescriptionTests(TuiTestCase):
@@ -234,6 +263,22 @@ class DescriptionTests(TuiTestCase):
         assert entry is not None
         self.assertEqual(entry.description, "original")
 
+    async def test_unsaveable_description_is_reported_not_swallowed(self) -> None:
+        target = str(self.files["main"].resolve())
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._move_cursor_to(target)
+            await pilot.pause()
+            await pilot.press("d")
+            await pilot.pause()
+            app.screen.query_one(Input).value = "will not land"
+            with mock.patch.object(index, "set_description", return_value=False):
+                with mock.patch.object(app, "notify") as notify:
+                    await pilot.press("enter")
+                    await pilot.pause()
+            self.assertIn("was not saved", notify.call_args[0][0])
+
     async def test_description_editing_keeps_the_selection(self) -> None:
         target = str(self.files["sty"].resolve())
         app = self.app()
@@ -261,6 +306,7 @@ class OpenInNeovimTests(TuiTestCase):
                 await pilot.press("enter")
                 await pilot.pause()
             run.assert_called_once()
+            self.assertIsNone(self.suspend.escaped)
             args, kwargs = run.call_args
             self.assertEqual(args[0], ["nvim", target])
             self.assertEqual(kwargs["cwd"], os.path.dirname(target))
@@ -279,16 +325,35 @@ class OpenInNeovimTests(TuiTestCase):
             self.assertEqual(app.selected_path, target)
             self.assertTrue(app.query_one("#files", DataTable).has_focus)
 
-    async def test_missing_neovim_is_explained(self) -> None:
+    async def test_missing_neovim_is_explained_without_suspending(self) -> None:
+        """`App.suspend()` does not restore the terminal if its body raises."""
         app = self.app()
         async with app.run_test() as pilot:
             await pilot.pause()
-            with mock.patch.object(subprocess, "run", side_effect=FileNotFoundError()):
+            with mock.patch.object(shutil, "which", return_value=None):
+                with mock.patch.object(subprocess, "run") as run:
+                    with mock.patch.object(app, "notify") as notify:
+                        await pilot.press("enter")
+                        await pilot.pause()
+            run.assert_not_called()
+            self.assertEqual(self.suspend.entered, 0)  # never handed the terminal over
+            notify.assert_called_once()
+            self.assertIn("Install it", notify.call_args[0][0])
+
+    async def test_editor_failure_is_reported_after_resuming(self) -> None:
+        """A subprocess error must be raised inside, not through, suspend()."""
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            with mock.patch.object(subprocess, "run", side_effect=OSError("boom")):
                 with mock.patch.object(app, "notify") as notify:
                     await pilot.press("enter")
                     await pilot.pause()
-            notify.assert_called_once()
-            self.assertIn("Install it", notify.call_args[0][0])
+            self.assertEqual(self.suspend.entered, 1)
+            # Nothing propagated out of the suspend block, so the terminal was
+            # handed back before the error was shown.
+            self.assertIsNone(self.suspend.escaped)
+            self.assertIn("Could not start Neovim", notify.call_args[0][0])
 
     async def test_unavailable_file_is_not_opened(self) -> None:
         target = str(self.files["chapter"].resolve())
@@ -394,6 +459,30 @@ class ScanControlTests(TuiTestCase):
         entry = index.get_file(conn, target)
         assert entry is not None
         self.assertEqual(entry.description, "written before quitting")
+
+
+class ScanFailureTests(TuiTestCase):
+    async def test_a_failing_scan_is_reported_and_can_be_retried(self) -> None:
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            with mock.patch.object(
+                index, "run_scan", side_effect=RuntimeError("disk on fire")
+            ):
+                with mock.patch.object(app, "notify") as notify:
+                    app.start_scan()
+                    for _ in range(200):
+                        await pilot.pause()
+                        if not app._scan_running:
+                            break
+            self.assertFalse(app._scan_running)  # not wedged
+            self.assertIn("disk on fire", notify.call_args[0][0])
+            self.assertIn("Scan failed", self.static_text(app, "#status"))
+            # A second scan is allowed once the first has failed.
+            with mock.patch.object(app, "notify") as notify:
+                await pilot.press("r")
+                await pilot.pause()
+            notify.assert_not_called()
 
 
 class TeardownTests(TuiTestCase):

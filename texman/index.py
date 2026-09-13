@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import stat
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -148,9 +149,23 @@ class ScanStats:
 # Traversal
 # --------------------------------------------------------------------------
 
+def matched_extension(name: str) -> str | None:
+    """Return the matched extension, lowercased, or None.
+
+    Matching is case-insensitive and does not use `os.path.splitext`, which
+    reports no extension at all for a name that is only a suffix, such as the
+    literal file name `.tex`.
+    """
+    lowered = name.lower()
+    for extension in MATCHED_EXTENSIONS:
+        if lowered.endswith(extension):
+            return extension
+    return None
+
+
 def matches(name: str) -> bool:
     """Match `.tex` and `.sty` case-insensitively."""
-    return name.lower().endswith(MATCHED_EXTENSIONS)
+    return matched_extension(name) is not None
 
 
 def _excluded_for(root: str) -> list[str]:
@@ -199,6 +214,9 @@ def walk_tree(
         except OSError:
             stats.note_skip(directory)
             continue
+        if not stat.S_ISDIR(key.st_mode):
+            stats.note_skip(directory)
+            continue
         identity = (key.st_dev, key.st_ino)
         if identity in visited:
             continue
@@ -218,7 +236,8 @@ def walk_tree(
                         if entry.is_dir(follow_symlinks=False):
                             pending.append(entry.path)
                             continue
-                        if not matches(entry.name):
+                        extension = matched_extension(entry.name)
+                        if extension is None:
                             continue
                         # follow_symlinks=True so a link to a real file counts
                         # and a broken link quietly does not.
@@ -232,7 +251,7 @@ def walk_tree(
                         yield FileRecord(
                             path=canonical,
                             parent_dir=os.path.dirname(canonical),
-                            extension=os.path.splitext(canonical)[1].lower(),
+                            extension=extension,
                         )
                     except OSError:
                         stats.note_skip(entry.path)
@@ -271,12 +290,17 @@ def upsert_files(conn: sqlite3.Connection, records: Sequence[FileRecord]) -> int
     return len(rows)
 
 
-def set_description(conn: sqlite3.Connection, path: str, description: str) -> None:
-    """Commit a description immediately so it survives a later crash."""
+def set_description(conn: sqlite3.Connection, path: str, description: str) -> bool:
+    """Commit a description immediately so it survives a later crash.
+
+    Returns False if no catalogued file has that path, so a caller never
+    silently discards something the user typed.
+    """
     with conn:
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE files SET description = ? WHERE path = ?", (description, path)
         )
+    return cursor.rowcount > 0
 
 
 # --------------------------------------------------------------------------

@@ -77,6 +77,29 @@ class ScanCommandTests(unittest.TestCase):
         self.assertIn("Full Disk Access", result.stdout)
 
 
+class ScanRootValidationTests(unittest.TestCase):
+    def test_missing_root_is_an_error_not_a_complete_scan(self) -> None:
+        result = run(["scan", "--root", "/definitely-not-here", "--quiet"])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("does not exist", result.stderr)
+        self.assertNotIn("complete", result.stdout)
+
+    def test_file_as_root_is_an_error(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".tex") as handle:
+            result = run(["scan", "--root", handle.name, "--quiet"])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("is not a directory", result.stderr)
+
+    def test_unusable_catalog_file_is_explained(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            bogus = Path(folder) / "not-a-catalog.sqlite3"
+            bogus.write_text("this is plain text, not a database")
+            result = run(["--db", str(bogus), "scan", "--root", folder, "--quiet"])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot use the catalog", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+
 class AiCommandTests(unittest.TestCase):
     """`texman ai` must never start the UI or scan, and must fail cleanly."""
 
@@ -107,6 +130,20 @@ class AiCommandTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
         self.assertIn("OPENAI_API_KEY", result.stderr)
+
+    def test_interactive_use_is_refused_instead_of_hanging(self) -> None:
+        """With a terminal on stdin there is no request to read, so say so."""
+        import io
+        from texman import ai
+
+        class Tty(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        err = io.StringIO()
+        code = ai.main(stdin=Tty(), stdout=io.StringIO(), stderr=err)
+        self.assertNotEqual(code, 0)
+        self.assertIn("standard input", err.getvalue())
 
     def test_ai_does_not_touch_the_catalog(self) -> None:
         db = Path(tempfile.mkdtemp()) / "never-created.sqlite3"

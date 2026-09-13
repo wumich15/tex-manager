@@ -100,6 +100,17 @@ tests still pass.
   teardown.
 - **Neovim is launched as an argument list**, never a shell string, with the
   file's parent directory as the working directory, inside `App.suspend()`.
+  Nothing may raise *through* that `with` block: `App.suspend()` resumes
+  application mode after the body but not on an exception, so an escaping error
+  leaves the user's terminal unusable. Check for the executable first and catch
+  subprocess errors inside the block.
+- **A failing scan must not crash or wedge the app.** The worker catches
+  everything, always reports a result, and clears the running flag, so `r`
+  works again afterwards.
+- **Bad input gets a clean message, never a traceback**: a scan root that is
+  missing or not a directory, and a `--db` file that is not a SQLite database.
+- **Never silently drop something the user typed.** `set_description` reports
+  whether a row matched, and the UI says so if the write found nothing.
 - **`texman ai` never modifies a file.** It reads one JSON object on stdin,
   writes only the snippet to stdout on success, and exits nonzero with a short
   stderr message on invalid input, missing configuration, API failure, refusal,
@@ -127,7 +138,7 @@ tests still pass.
 ## Verifying changes
 
 ```sh
-python -m unittest discover -s tests -t .       # 90 checks
+python -m unittest discover -s tests -t .       # 101 checks
 nvim --headless -u NONE -l tests/test_nvim.lua  # 58 checks
 ```
 

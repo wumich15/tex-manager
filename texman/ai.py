@@ -327,6 +327,11 @@ def main(
     stdout = stdout or sys.stdout
     stderr = stderr or sys.stderr
     try:
+        if stdin.isatty():
+            raise AiError(
+                "this command reads a JSON request on standard input and is run "
+                "by the Neovim :TexAI command, not directly"
+            )
         request = parse_request(stdin.read())
         snippet = generate(request, client_factory=client_factory)
     except AiError as exc:

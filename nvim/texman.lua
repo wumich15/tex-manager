@@ -8,6 +8,9 @@ local M = {}
 
 local DEFAULT_COMMAND = 'TexAI'
 local TEX_FILETYPES = { tex = true, plaintex = true, latex = true, context = true }
+-- The helper already caps its own API request at 60 seconds; this is a backstop
+-- so a wedged process cannot block the buffer's next request forever.
+local REQUEST_TIMEOUT_MS = 90000
 
 -- One active request per buffer, keyed by buffer handle.
 local active = {}
@@ -117,8 +120,18 @@ function M.request(args)
   local function on_exit(result)
     vim.schedule(function()
       if result.code ~= 0 then
-        finish(first_line(result.stderr) or ('helper exited with status ' .. tostring(result.code)),
-          vim.log.levels.ERROR)
+        local message = first_line(result.stderr)
+        if not message then
+          if result.signal ~= nil and result.signal ~= 0 then
+            message = string.format(
+              'the helper was stopped after %d seconds; run the command again',
+              REQUEST_TIMEOUT_MS / 1000
+            )
+          else
+            message = 'helper exited with status ' .. tostring(result.code)
+          end
+        end
+        finish(message, vim.log.levels.ERROR)
         return
       end
       local output = result.stdout or ''
@@ -147,6 +160,7 @@ function M.request(args)
   local ok, launch_error = pcall(vim.system, { 'texman', 'ai' }, {
     stdin = payload,
     text = true,
+    timeout = REQUEST_TIMEOUT_MS,
   }, on_exit)
   if not ok then
     active[buf] = nil

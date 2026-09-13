@@ -131,6 +131,27 @@ class WalkTests(unittest.TestCase):
         self.assertTrue(seen)
         self.assertEqual(stats.current_dir, "")
 
+    def test_name_that_is_only_an_extension_keeps_its_extension(self) -> None:
+        # os.path.splitext reports no extension for a bare ".tex" name.
+        bare = self.root / "papers" / ".tex"
+        bare.write_text("x")
+        stats = index.ScanStats()
+        records = {r.path: r for r in index.walk_tree(self.root, stats)}
+        self.assertEqual(records[str(bare)].extension, ".tex")
+
+    def test_a_file_given_as_the_root_is_not_counted_as_a_directory(self) -> None:
+        stats = index.ScanStats()
+        found = list(index.walk_tree(self.files["main"], stats))
+        self.assertEqual(found, [])
+        self.assertEqual(stats.dirs_visited, 0)
+        self.assertEqual(stats.skipped, 1)
+
+    def test_missing_root_is_reported_as_skipped(self) -> None:
+        stats = index.ScanStats()
+        self.assertEqual(list(index.walk_tree(self.root / "nope", stats)), [])
+        self.assertEqual(stats.dirs_visited, 0)
+        self.assertEqual(stats.skipped, 1)
+
     def test_excluded_roots_reported_only_when_under_root(self) -> None:
         _, stats = self.scan_paths()
         self.assertEqual(stats.excluded_roots, [])
@@ -203,6 +224,15 @@ class CatalogTests(unittest.TestCase):
         assert entry is not None
         self.assertEqual(entry.description, "chapter two")
         self.assertFalse(entry.available)
+
+    def test_setting_a_description_reports_whether_it_landed(self) -> None:
+        self.scan()
+        conn = index.connect(self.db)
+        self.addCleanup(conn.close)
+        target = str(self.files["main"].resolve())
+        self.assertTrue(index.set_description(conn, target, "kept"))
+        # An uncatalogued path must not be silently accepted.
+        self.assertFalse(index.set_description(conn, str(self.root / "ghost.tex"), "lost"))
 
     def test_descriptions_with_quotes_are_stored_verbatim(self) -> None:
         self.scan()

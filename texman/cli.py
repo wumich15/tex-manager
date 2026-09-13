@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -20,6 +21,18 @@ FULL_DISK_ACCESS_NOTE = (
     "Access in System Settings > Privacy & Security, then rescan. Unmounted "
     "drives cannot be scanned."
 )
+
+
+def _catalog_error(db_path: str | None, exc: Exception) -> str:
+    """Explain an unusable catalog file instead of showing a traceback."""
+    from . import index
+
+    location = db_path or str(index.default_db_path())
+    return (
+        f"texman: cannot use the catalog at {location}: {exc}\n"
+        "If that file is not a texman database, pass a different --db path, or "
+        "move the file aside and let texman create a new catalog."
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,7 +67,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run_scan(args: argparse.Namespace) -> int:
+    import os
+
     from . import index
+
+    if not os.path.isdir(args.root):
+        what = "is not a directory" if os.path.exists(args.root) else "does not exist"
+        print(f"texman: scan root {args.root!r} {what}", file=sys.stderr)
+        return 2
 
     last = [0.0]
     stop = threading.Event()
@@ -91,6 +111,9 @@ def _run_scan(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:  # a second Ctrl-C
         print("\nScan interrupted; discoveries already written were kept.", file=sys.stderr)
         return 130
+    except sqlite3.Error as exc:
+        print(_catalog_error(args.db, exc), file=sys.stderr)
+        return 2
     finally:
         signal.signal(signal.SIGINT, signal.default_int_handler)
     if not args.quiet:
@@ -108,7 +131,11 @@ def _run_tui(args: argparse.Namespace) -> int:
     from .tui import TexmanApp
 
     app = TexmanApp(db_path=args.db)
-    app.run()
+    try:
+        app.run()
+    except sqlite3.Error as exc:
+        print(_catalog_error(args.db, exc), file=sys.stderr)
+        return 2
     return 0
 
 

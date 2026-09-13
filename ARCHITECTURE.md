@@ -150,8 +150,14 @@ makes every handler and redraw a no-op outside that window.
 Opening a file uses `App.suspend()` around
 `subprocess.run(["nvim", path], cwd=parent_dir)`. The path is a separate
 argument list element and no shell is involved, so spaces and special characters
-work. `FileNotFoundError` becomes an explanation of how to install Neovim. After
-the editor exits, the catalog is reloaded and the same row is reselected.
+work. After the editor exits, the same row is reselected; the table itself is
+not rebuilt, because editing a file changes no catalogued field.
+
+`App.suspend()` resumes application mode after its `with` body but *not* if the
+body raises, so an exception escaping it leaves the terminal in the suspended
+state with the app still running. Neovim's absence is therefore checked with
+`shutil.which` before suspending, and the subprocess call is wrapped in its own
+`try` inside the block, with the failure reported after the terminal is back.
 
 ## AI helper
 
@@ -227,7 +233,7 @@ never saved automatically.
 
 ## Verification
 
-- `python -m unittest discover -s tests -t .` — 90 checks. `test_index.py`
+- `python -m unittest discover -s tests -t .` — 101 checks. `test_index.py`
   builds a temporary fixture with nested files, hidden folders, duplicate
   filenames, spaces, an uppercase extension, a symlink loop, a broken link, and
   a `chmod 000` directory, and covers description persistence across restarts,

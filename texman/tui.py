@@ -8,6 +8,7 @@ through messages. See https://textual.textualize.io/guide/workers/.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -65,6 +66,7 @@ class ScanBatch(Message):
 @dataclass
 class ScanFinished(Message):
     stats: index.ScanStats
+    error: str | None = None
 
 
 # --------------------------------------------------------------------------
@@ -257,7 +259,10 @@ class TexmanApp(App[None]):
 
     def _empty_message(self) -> str:
         if self._filter:
-            return f"Nothing matches “{self._filter}”. Press Escape to clear the filter."
+            return (
+                f"Nothing matches “{self._filter}”.\n"
+                "Edit the filter above, or empty it to see every file again."
+            )
         if index.count_files(self._conn) == 0:
             return (
                 "No .tex or .sty files catalogued yet.\n"
@@ -377,13 +382,22 @@ class TexmanApp(App[None]):
         def batch(records, stats: index.ScanStats) -> None:
             self.post_message(ScanBatch(count=len(records)))
 
-        stats = index.run_scan(
-            root,
-            db_path=self._db_path,
-            should_cancel=lambda: worker.is_cancelled,
-            on_progress=progress,
-            on_batch=batch,
-        )
+        stats = index.ScanStats(root=root)
+        try:
+            stats = index.run_scan(
+                root,
+                db_path=self._db_path,
+                should_cancel=lambda: worker.is_cancelled,
+                on_progress=progress,
+                on_batch=batch,
+            )
+        except Exception as exc:
+            # A failing scan must not crash the app or leave it believing a scan
+            # is still running; report it and let the user try again.
+            self.post_message(
+                ScanFinished(stats=stats, error=f"{type(exc).__name__}: {exc}")
+            )
+            return
         self.post_message(ScanFinished(stats=stats))
 
     def on_scan_progress(self, message: ScanProgress) -> None:
@@ -400,6 +414,15 @@ class TexmanApp(App[None]):
         self._last_stats = message.stats
         self._pending_refresh = False
         self.reload_catalog()
+        if message.error is not None:
+            self._update_status(f"Scan failed: {message.error}")
+            self.notify(
+                f"The scan stopped with an error: {message.error}. Everything "
+                "already catalogued was kept; press r to try again.",
+                severity="error",
+                timeout=12,
+            )
+            return
         summary = message.stats.summary()
         if message.stats.skipped_samples:
             summary += f" · e.g. {message.stats.skipped_samples[0]}"
@@ -465,14 +488,23 @@ class TexmanApp(App[None]):
     def _open_in_neovim(self, entry: index.CatalogEntry) -> None:
         """Hand the terminal to Neovim, then restore the same selection."""
         keep = entry.path
-        try:
-            with self.suspend():
-                subprocess.run(["nvim", entry.path], cwd=entry.parent_dir, check=False)
-        except FileNotFoundError:
+        if shutil.which("nvim") is None:
             self.notify(NVIM_MISSING, severity="error", timeout=12)
             return
-        except OSError as exc:
-            self.notify(f"Could not start Neovim: {exc}", severity="error")
+        # `App.suspend()` resumes application mode after the `with` body, but not
+        # if the body raises, which would leave the terminal unusable. So the
+        # subprocess failure is captured inside the block and reported after it.
+        failure: OSError | None = None
+        with self.suspend():
+            try:
+                subprocess.run(["nvim", entry.path], cwd=entry.parent_dir, check=False)
+            except OSError as exc:
+                failure = exc
+        if failure is not None:
+            if isinstance(failure, FileNotFoundError):
+                self.notify(NVIM_MISSING, severity="error", timeout=12)
+            else:
+                self.notify(f"Could not start Neovim: {failure}", severity="error")
             return
         # Editing a file changes no catalogued field, so the table stands as it
         # is and the same row stays selected.
@@ -493,7 +525,13 @@ class TexmanApp(App[None]):
             if value is None:
                 return
             description = value.strip()
-            index.set_description(self._conn, path, description)
+            if not index.set_description(self._conn, path, description):
+                self.notify(
+                    f"{path} is no longer in the catalog, so the description was "
+                    "not saved. Rescan with r and try again.",
+                    severity="error",
+                )
+                return
             self._update_description_cell(path, description)
 
         self.push_screen(DescriptionDialog(entry.name, entry.description), save)

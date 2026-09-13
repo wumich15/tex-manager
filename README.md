@@ -35,21 +35,40 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for how it works internally.
 
 ## Install
 
-1. Install Python 3.11+, `pipx`, and Neovim 0.10+:
+1. Check what you already have. You need Python 3.11 or newer and, to open
+   files or use `:TexAI`, Neovim 0.10 or newer:
 
    ```sh
-   brew install python pipx neovim
+   python3 --version
+   nvim --version | head -1
    ```
 
-2. From a clone of this repository:
+   Install whatever is missing or too old (macOS, with Homebrew):
 
    ```sh
-   pipx install -e .
+   brew install python neovim
+   ```
+
+2. Install `pipx`, which keeps `texman` in its own environment while putting the
+   command on your `PATH`:
+
+   ```sh
+   brew install pipx      # or: python3 -m pip install --user pipx
    pipx ensurepath
    ```
 
-3. Open a new terminal and check that the command is on your `PATH` from
-   anywhere:
+   `pipx ensurepath` adds `~/.local/bin` to your `PATH` if it isn't there
+   already. Open a new terminal afterwards.
+
+3. Install `texman` from a clone of this repository. `-e` installs it in
+   editable mode, so `git pull` updates the command without reinstalling:
+
+   ```sh
+   cd /path/to/tex-manager
+   pipx install -e .
+   ```
+
+4. Check that the command works from somewhere else entirely:
 
    ```sh
    cd ~ && texman --help
@@ -107,19 +126,24 @@ File management needs neither of these variables; `:TexAI` needs both.
    (`~/.zshrc`), never in a file tracked by this repository. API usage is billed
    to your own OpenAI account.
 
-3. Copy the Lua module into your Neovim configuration and load it:
+3. Copy the Lua module into your Neovim configuration:
 
    ```sh
-   mkdir -p "$(nvim --headless -c 'echo stdpath("config")' -c qa 2>&1)/lua"
+   mkdir -p ~/.config/nvim/lua
    cp nvim/texman.lua ~/.config/nvim/lua/texman.lua
    ```
 
-   Then add this line to your existing `~/.config/nvim/init.lua`, keeping the
-   rest of your configuration:
+   Then add one line to your existing `~/.config/nvim/init.lua`, keeping the
+   rest of your configuration exactly as it is:
 
    ```lua
    require('texman').setup()
    ```
+
+   This is a plain module, not a plugin spec, so it works alongside a plugin
+   manager such as lazy.nvim without being registered with it. If your
+   configuration is `init.vim` rather than `init.lua`, use
+   `lua require('texman').setup()` instead.
 
    If you already have a `:TexAI` command, `setup` says so and leaves it alone.
    Choose another uppercase name instead:
@@ -166,7 +190,7 @@ are not followed.
 ## Tests
 
 ```sh
-python -m unittest discover -s tests -t .     # 90 checks
+python -m unittest discover -s tests -t .     # 101 checks
 nvim --headless -u NONE -l tests/test_nvim.lua  # 58 checks
 ```
 
