@@ -5,7 +5,8 @@
 -- A fake `texman` executable stands in for the real helper, so this check
 -- makes no API calls. It covers insertion before the first and a middle line,
 -- appending, invalid lines, unsaved context, one-step undo, switched buffers,
--- changed and closed buffers, and helper failure.
+-- changed and closed buffers, helper failure, log-driven fixes, and drafting
+-- key mappings into the mappings file.
 
 local script_dir = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':p:h')
 local module_path = script_dir .. '/../nvim/texman.lua'
@@ -45,6 +46,16 @@ SNIPPET
   slow)
     sleep 1
     printf '%s\n' '\alpha'
+    ;;
+  keymap)
+    printf '%s\n' "vim.keymap.set('n', '<leader>zz', function() vim.notify('texman greeting') end, { desc = 'texman test mapping' })"
+    ;;
+  keymap_slow)
+    sleep 1
+    printf '%s\n' "vim.keymap.set('n', '<leader>zz', function() vim.notify('texman greeting') end, { desc = 'texman test mapping' })"
+    ;;
+  keymap_bad)
+    printf '%s\n' "vim.keymap.set('n' <<< not lua"
     ;;
   empty)
     exit 0
@@ -132,6 +143,8 @@ local function write_log(path, body)
 end
 
 local texman = dofile(module_path)
+local keymaps_file = tmp .. '/texman-keymaps.lua'
+local keymap_snippet = "vim.keymap.set('n', '<leader>zz', function() vim.notify('texman greeting') end, { desc = 'texman test mapping' })"
 local sample = { '\\documentclass{article}', '\\begin{document}', 'Hello.', '\\end{document}' }
 local snippet = { '\\begin{equation}', '  x = 1', '\\end{equation}' }
 
@@ -142,7 +155,7 @@ end
 
 -- --------------------------------------------------------------------- setup
 
-ok('setup registers :TexAI', texman.setup() == true)
+ok('setup registers :TexAI', texman.setup({ keymaps_file = keymaps_file }) == true)
 eq('command name recorded', texman.command_name, 'TexAI')
 ok('command exists', vim.api.nvim_get_commands({})['TexAI'] ~= nil)
 
@@ -662,6 +675,128 @@ do
 end
 
 vim.env.TEXMAN_FAKE_MODE = 'ok'
+
+-- ------------------------------------------------------------- :TexAIMap
+
+ok('map command registered', vim.api.nvim_get_commands({})['TexAIMap'] ~= nil)
+eq('map command name recorded', texman.map_command_name, 'TexAIMap')
+eq('mappings file is the configured one', texman.keymaps_file, keymaps_file)
+
+local function map(args)
+  notes = {}
+  texman.map(args)
+end
+
+do
+  vim.fn.delete(capture)
+  vim.env.TEXMAN_FAKE_CAPTURE = capture
+  map('   ')
+  vim.wait(150)
+  vim.env.TEXMAN_FAKE_CAPTURE = nil
+  ok('an empty mapping request is refused', string.match(last_note(), 'usage') ~= nil, last_note())
+  ok('no helper call for an empty mapping request', vim.fn.filereadable(capture) == 0)
+end
+
+do
+  vim.env.TEXMAN_FAKE_MODE = 'keymap'
+  vim.fn.delete(capture)
+  vim.env.TEXMAN_FAKE_CAPTURE = capture
+  vim.cmd('enew')
+  local windows_before = #vim.api.nvim_list_wins()
+  map('a shortcut that echoes a greeting')
+  ok('a drafted mapping is reported', wait_for('appended'), last_note())
+  vim.env.TEXMAN_FAKE_CAPTURE = nil
+  local payload = vim.json.decode(table.concat(vim.fn.readfile(capture), '\n'))
+  eq('keymap mode is requested', payload.mode, 'keymap')
+  eq('the mapping prompt is sent', payload.prompt, 'a shortcut that echoes a greeting')
+  eq('an absent mappings file is sent as empty text', payload.keymap_file_text, '')
+  ok('mapped keys are sent as a list', type(payload.mapped_keys) == 'table')
+  ok('no document lines are sent for a mapping', payload.buffer_lines == nil)
+  eq('the mappings file opened in a new window', #vim.api.nvim_list_wins(), windows_before + 1)
+  local buf = vim.api.nvim_get_current_buf()
+  eq('the split shows the mappings file',
+    vim.fn.resolve(vim.api.nvim_buf_get_name(buf)), vim.fn.resolve(keymaps_file))
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, true)
+  ok('a new mappings file starts with the header', string.match(lines[1], 'TexAIMap') ~= nil, lines[1])
+  eq('the request is recorded as a comment', lines[5], '-- a shortcut that echoes a greeting')
+  eq('the drafted code follows the comment', lines[6], keymap_snippet)
+  eq('the cursor is on the draft', vim.api.nvim_win_get_cursor(0)[1], 5)
+  ok('the draft is not written to disk', vim.fn.filereadable(keymaps_file) == 0)
+  ok('the buffer is left modified for review', vim.bo[buf].modified)
+  ok('the mapping is not active before :w', vim.fn.maparg('<leader>zz', 'n') == '')
+  notes = {}
+  vim.cmd('silent write')
+  ok('writing the file activates it', wait_for('are active'), last_note())
+  ok('the mapping is active after :w', vim.fn.maparg('<leader>zz', 'n') ~= '')
+  vim.cmd('close')
+end
+
+do
+  vim.env.TEXMAN_FAKE_MODE = 'keymap'
+  vim.fn.delete(capture)
+  vim.env.TEXMAN_FAKE_CAPTURE = capture
+  map('another shortcut')
+  ok('a second draft is appended', wait_for('appended'), last_note())
+  vim.env.TEXMAN_FAKE_CAPTURE = nil
+  local payload = vim.json.decode(table.concat(vim.fn.readfile(capture), '\n'))
+  ok('the existing file is sent as context',
+    string.match(payload.keymap_file_text, 'echoes a greeting') ~= nil)
+  ok('the active mapping is listed as taken',
+    vim.tbl_contains(payload.mapped_keys, 'n \\zz'), vim.inspect(payload.mapped_keys))
+  local buf = vim.api.nvim_get_current_buf()
+  local on_disk = vim.fn.readfile(keymaps_file)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, true)
+  eq('the draft follows the saved contents', #lines, #on_disk + 3)
+  eq('a blank line separates drafts', lines[#on_disk + 1], '')
+  eq('the second request is recorded', lines[#on_disk + 2], '-- another shortcut')
+  vim.cmd('silent undo')
+  eq('one undo removes only the draft', vim.api.nvim_buf_get_lines(buf, 0, -1, true), on_disk)
+  vim.cmd('close')
+end
+
+do
+  vim.env.TEXMAN_FAKE_MODE = 'keymap_bad'
+  local windows_before = #vim.api.nvim_list_wins()
+  local on_disk = vim.fn.readfile(keymaps_file)
+  map('a broken shortcut')
+  ok('Lua that does not compile is refused', wait_for('does not compile'), last_note())
+  eq('no window opens for a refused draft', #vim.api.nvim_list_wins(), windows_before)
+  eq('the mappings file is untouched by a refused draft', vim.fn.readfile(keymaps_file), on_disk)
+end
+
+do
+  vim.env.TEXMAN_FAKE_MODE = 'empty'
+  local on_disk = vim.fn.readfile(keymaps_file)
+  map('a shortcut with no answer')
+  ok('empty mapping output is reported', wait_for('no Lua'), last_note())
+  eq('the mappings file is untouched by empty output', vim.fn.readfile(keymaps_file), on_disk)
+end
+
+do
+  vim.env.TEXMAN_FAKE_MODE = 'keymap_slow'
+  map('first mapping')
+  notes = {}
+  texman.map('second mapping')
+  ok('a second mapping request is refused while one runs',
+    string.match(last_note(), 'already running') ~= nil, last_note())
+  ok('the first mapping request still completes', wait_for('appended'), last_note())
+  vim.cmd('silent undo')
+  vim.cmd('close')
+  vim.env.TEXMAN_FAKE_MODE = 'ok'
+end
+
+do
+  local broken = tmp .. '/broken-keymaps.lua'
+  vim.fn.writefile({ 'vim.keymap.set(' }, broken)
+  local saved = texman.keymaps_file
+  texman.keymaps_file = broken
+  notes = {}
+  ok('a broken mappings file is reported, not raised', texman.load_keymaps() == false)
+  ok('the report names the problem', string.match(last_note(), 'could not load') ~= nil, last_note())
+  texman.keymaps_file = tmp .. '/absent-keymaps.lua'
+  ok('a missing mappings file is fine', texman.load_keymaps() == true)
+  texman.keymaps_file = saved
+end
 
 -- ------------------------------------------------------------------ summary
 

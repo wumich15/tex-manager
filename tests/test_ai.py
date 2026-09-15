@@ -529,3 +529,111 @@ class MainTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class KeymapModeTests(unittest.TestCase):
+    """`keymap` requests describe Neovim's key state, not a document."""
+
+    def payload(self, **extra) -> str:
+        body = {"mode": "keymap", "prompt": "enumerate with the cursor inside"}
+        body.update(extra)
+        return json.dumps(body)
+
+    def test_needs_no_buffer_or_line(self) -> None:
+        request = ai.parse_request(self.payload())
+        self.assertEqual(request.mode, ai.MODE_KEYMAP)
+        self.assertEqual(request.buffer_lines, [])
+        self.assertEqual(request.mapped_keys, ())
+
+    def test_carries_neovim_state(self) -> None:
+        request = ai.parse_request(
+            self.payload(
+                keymap_file_text="-- one",
+                mapleader=" ",
+                maplocalleader=",",
+                mapped_keys=["n <leader>e", "i <Tab>l"],
+            )
+        )
+        self.assertEqual(request.keymap_file_text, "-- one")
+        self.assertEqual(request.mapleader, " ")
+        self.assertEqual(request.maplocalleader, ",")
+        self.assertEqual(request.mapped_keys, ("n <leader>e", "i <Tab>l"))
+
+    def test_rejects_malformed_state(self) -> None:
+        for extra in (
+            {"keymap_file_text": 3},
+            {"mapleader": None},
+            {"mapped_keys": "n x"},
+            {"mapped_keys": [1]},
+        ):
+            with self.assertRaises(ai.AiError):
+                ai.parse_request(self.payload(**extra))
+
+    def test_prompt_is_still_required(self) -> None:
+        with self.assertRaises(ai.AiError):
+            ai.parse_request(json.dumps({"mode": "keymap", "prompt": " "}))
+
+    def test_mapped_keys_are_capped(self) -> None:
+        keys = [f"n <leader>{n}" for n in range(ai.MAX_MAPPED_KEYS + 50)]
+        request = ai.parse_request(self.payload(mapped_keys=keys))
+        self.assertEqual(len(request.mapped_keys), ai.MAX_MAPPED_KEYS)
+
+    def test_body_names_the_request_leaders_keys_and_file(self) -> None:
+        request = ai.parse_request(
+            self.payload(
+                keymap_file_text="-- existing mapping",
+                mapleader=" ",
+                mapped_keys=["i <Tab>l"],
+            )
+        )
+        body = ai.build_input(request)
+        self.assertIn("Request: enumerate with the cursor inside", body)
+        self.assertIn("mapleader is ' '", body)
+        self.assertIn("maplocalleader is unset", body)
+        self.assertIn("i <Tab>l", body)
+        self.assertIn("-- existing mapping", body)
+        self.assertIn("reference only", body)
+
+    def test_empty_file_is_labelled(self) -> None:
+        body = ai.build_input(ai.parse_request(self.payload()))
+        self.assertIn("(empty)", body)
+        self.assertIn("(none reported)", body)
+
+    def test_long_file_keeps_its_tail(self) -> None:
+        text = "-- old\n" * 3000 + "-- newest mapping\n"
+        request = ai.parse_request(self.payload(keymap_file_text=text))
+        body = ai.build_input(request)
+        self.assertIn("omitted", body)
+        self.assertIn("-- newest mapping", body)
+        self.assertLess(len(body), ai.MAX_KEYMAP_FILE_CHARS + 1_500)
+
+    def test_uses_the_keymap_instructions(self) -> None:
+        request = ai.parse_request(self.payload())
+        instructions = ai.instructions_for(request)
+        self.assertIs(instructions, ai.INSTRUCTIONS_KEYMAP)
+        self.assertIn("No Markdown", instructions)
+        self.assertIn("vim.keymap.set", instructions)
+        self.assertIn(ai.KEYMAP_GROUP, instructions)
+        self.assertIn("never create or clear an augroup", instructions)
+        self.assertIn('"\\\\begin{enumerate}"', instructions)
+
+    def test_generate_returns_lua_and_strips_a_fence(self) -> None:
+        code = "vim.keymap.set('n', '<leader>e', 'x', { desc = 'e' })"
+        client = StubClient(response(f"```lua\n{code}\n```"))
+        with mock.patch.dict(
+            os.environ, {ai.MODEL_ENV: "test-model", ai.KEY_ENV: "sk-test"}
+        ):
+            result = ai.generate(
+                ai.parse_request(self.payload()), client_factory=lambda: client
+            )
+        self.assertEqual(result, code)
+        self.assertEqual(client.calls[0]["instructions"], ai.INSTRUCTIONS_KEYMAP)
+
+    def test_empty_output_says_lua(self) -> None:
+        client = StubClient(response("   "))
+        with mock.patch.dict(
+            os.environ, {ai.MODEL_ENV: "test-model", ai.KEY_ENV: "sk-test"}
+        ):
+            with self.assertRaises(ai.AiError) as caught:
+                ai.generate(ai.parse_request(self.payload()), client_factory=lambda: client)
+        self.assertIn("no Lua", str(caught.exception))

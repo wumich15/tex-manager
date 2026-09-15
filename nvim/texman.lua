@@ -2,8 +2,9 @@
 --
 --   :TexAI <line> <prompt>   insert generated LaTeX before <line>
 --   :TexAIFix [guidance]     replace the line the compiler blamed
+--   :TexAIMap <prompt>       draft a key mapping into texman's mappings file
 --
--- Both Ex commands start with an uppercase letter as Neovim requires, and `/`
+-- All Ex commands start with an uppercase letter as Neovim requires, and `/`
 -- is left alone so ordinary search keeps working. Insertion and replacement
 -- happen here; the `texman ai` helper only produces text.
 
@@ -11,6 +12,21 @@ local M = {}
 
 local DEFAULT_COMMAND = 'TexAI'
 local DEFAULT_FIX_COMMAND = 'TexAIFix'
+local DEFAULT_MAP_COMMAND = 'TexAIMap'
+-- Mappings drafted by :TexAIMap live in their own file, loaded by `setup()`
+-- inside pcall, so a bad mapping can never break Neovim's startup. init.lua
+-- itself is never edited.
+local KEYMAPS_FILE_NAME = 'texman-keymaps.lua'
+local KEYMAP_GROUP = 'texman_keymaps'
+local KEYMAPS_HEADER = {
+  '-- Key mappings drafted with :TexAIMap.',
+  "-- require('texman').setup() runs this file at startup, and again each time it",
+  '-- is written. Edit or delete anything here freely.',
+}
+-- Keys already taken are sent so the model avoids them; a handful of modes
+-- and a cap keep that list short.
+local MAPPED_MODES = { 'n', 'i', 'v' }
+local MAX_MAPPED_KEYS = 300
 local TEX_FILETYPES = { tex = true, plaintex = true, latex = true, context = true }
 local TEX_SUFFIXES = { '.tex', '.sty', '.cls', '.ltx' }
 
@@ -20,8 +36,10 @@ local REQUEST_TIMEOUT_MS = 90000
 -- Logs are normally tens of kilobytes; this only guards a pathological one.
 local MAX_LOG_BYTES = 500000
 
--- One active request per buffer, keyed by buffer handle.
+-- One active request per target, keyed by buffer handle, or by KEYMAP_KEY for
+-- the mappings file.
 local active = {}
+local KEYMAP_KEY = 'keymap'
 
 local function notify(message, level)
   vim.notify('texman: ' .. message, level or vim.log.levels.INFO)
@@ -82,20 +100,24 @@ end
 
 -- ---------------------------------------------------------------- requests
 
---- Run one helper request for `buf`, applying the output on success.
+--- Run one helper request, handing its output to `on_output` on success.
 ---
---- `apply` receives the buffer and the helper's stdout and returns a message
---- describing what changed. It runs only after the buffer has been re-checked.
-local function send(buf, payload, apply, progress)
-  if active[buf] then
-    notify('a request is already running for this buffer', vim.log.levels.WARN)
+--- `key` limits concurrency: one request per buffer, or per mappings file.
+--- `on_output` receives the helper's stdout and returns a message describing
+--- what changed, plus an optional log level. `empty` is the message for a
+--- helper that printed nothing.
+local function send(key, payload, on_output, progress, empty)
+  if active[key] then
+    notify(
+      key == KEYMAP_KEY and 'a mapping request is already running'
+        or 'a request is already running for this buffer',
+      vim.log.levels.WARN
+    )
     return
   end
 
-  local tick = vim.api.nvim_buf_get_changedtick(buf)
-
   local function finish(message, level)
-    active[buf] = nil
+    active[key] = nil
     if message then
       notify(message, level)
     end
@@ -120,37 +142,45 @@ local function send(buf, payload, apply, progress)
       end
       local output = result.stdout or ''
       if string.match(output, '^%s*$') then
-        finish('the helper produced no LaTeX', vim.log.levels.ERROR)
+        finish(empty or 'the helper produced no LaTeX', vim.log.levels.ERROR)
         return
       end
-      if not vim.api.nvim_buf_is_loaded(buf) then
-        finish('the buffer was closed; rerun the command', vim.log.levels.WARN)
-        return
-      end
-      if not vim.bo[buf].modifiable then
-        finish('the buffer is no longer modifiable; rerun the command', vim.log.levels.WARN)
-        return
-      end
-      if vim.api.nvim_buf_get_changedtick(buf) ~= tick then
-        finish('the buffer changed since the request; rerun the command', vim.log.levels.WARN)
-        return
-      end
-      finish(apply(buf, output))
+      finish(on_output(output))
     end)
   end
 
-  active[buf] = true
+  active[key] = true
   local ok, launch_error = pcall(vim.system, { 'texman', 'ai' }, {
     stdin = vim.json.encode(payload),
     text = true,
     timeout = REQUEST_TIMEOUT_MS,
   }, on_exit)
   if not ok then
-    active[buf] = nil
+    active[key] = nil
     notify('could not run `texman ai`: ' .. tostring(launch_error), vim.log.levels.ERROR)
     return
   end
   notify(progress)
+end
+
+--- Wrap `apply(buf, output)` so it runs only if `buf` is still as it was.
+---
+--- The changedtick is captured now, when the request is built, and re-checked
+--- when the output arrives, so a result never lands on a stale line.
+local function guarded(buf, apply)
+  local tick = vim.api.nvim_buf_get_changedtick(buf)
+  return function(output)
+    if not vim.api.nvim_buf_is_loaded(buf) then
+      return 'the buffer was closed; rerun the command', vim.log.levels.WARN
+    end
+    if not vim.bo[buf].modifiable then
+      return 'the buffer is no longer modifiable; rerun the command', vim.log.levels.WARN
+    end
+    if vim.api.nvim_buf_get_changedtick(buf) ~= tick then
+      return 'the buffer changed since the request; rerun the command', vim.log.levels.WARN
+    end
+    return apply(buf, output)
+  end
 end
 
 -- -------------------------------------------------------- :TexAI (insert)
@@ -206,7 +236,7 @@ function M.request(args)
     return string.format('inserted %d line(s) before line %d; press u to undo', #lines, line)
   end
 
-  send(buf, payload, apply, string.format('generating LaTeX for line %d …', line))
+  send(buf, payload, guarded(buf, apply), string.format('generating LaTeX for line %d …', line))
 end
 
 -- ------------------------------------------------------- :TexAIFix (repair)
@@ -472,9 +502,142 @@ function M.fix(args)
   send(
     buf,
     payload,
-    apply,
+    guarded(buf, apply),
     string.format('fixing line %d: %s%s', entry.line, entry.message, assumed)
   )
+end
+
+-- ------------------------------------------------------ :TexAIMap (mappings)
+
+local function keymaps_path()
+  return M.keymaps_file or (vim.fn.stdpath('config') .. '/' .. KEYMAPS_FILE_NAME)
+end
+
+--- Run the mappings file, if there is one. Returns true unless it failed.
+---
+--- The autocmd group the file's mappings use is cleared first, so running the
+--- file again after an edit does not leave stale autocmds behind.
+function M.load_keymaps()
+  local path = keymaps_path()
+  if vim.fn.filereadable(path) == 0 then
+    return true
+  end
+  vim.api.nvim_create_augroup(KEYMAP_GROUP, { clear = true })
+  local ok, err = pcall(dofile, path)
+  if not ok then
+    notify(
+      'could not load ' .. path .. ': ' .. tostring(err) .. ' -- fix the file and write it again',
+      vim.log.levels.ERROR
+    )
+    return false
+  end
+  return true
+end
+
+--- The keys already mapped, as "mode lhs", so the helper can avoid them.
+local function mapped_keys()
+  local keys, seen = {}, {}
+  local function add(mode, maps)
+    for _, map in ipairs(maps) do
+      local entry = mode .. ' ' .. map.lhs
+      if not seen[entry] and #keys < MAX_MAPPED_KEYS then
+        seen[entry] = true
+        table.insert(keys, entry)
+      end
+    end
+  end
+  for _, mode in ipairs(MAPPED_MODES) do
+    add(mode, vim.api.nvim_get_keymap(mode))
+    add(mode, vim.api.nvim_buf_get_keymap(0, mode))
+  end
+  return keys
+end
+
+--- Compile Lua without running it; a snippet that does not parse is refused.
+local function compiles(code)
+  local loader = loadstring or load
+  local chunk, err = loader(code, '=texman keymap')
+  if chunk then
+    return true
+  end
+  return false, err
+end
+
+--- Draft a mapping from a description and append it to the mappings file.
+---
+--- The file is opened in a split with the new lines appended as one undoable
+--- change, and nothing is written: `:w` keeps the mapping and loads it, `u`
+--- discards it. That way the user reads the code before Neovim ever runs it.
+function M.map(args)
+  local prompt = vim.trim(args or '')
+  if prompt == '' then
+    notify(
+      'usage: :' .. (M.map_command_name or DEFAULT_MAP_COMMAND) .. ' <what the shortcut should do>',
+      vim.log.levels.ERROR
+    )
+    return
+  end
+
+  local path = keymaps_path()
+  local existing = ''
+  if vim.fn.filereadable(path) == 1 then
+    existing = table.concat(vim.fn.readfile(path), '\n')
+  end
+
+  local payload = {
+    mode = 'keymap',
+    prompt = prompt,
+    keymap_file_text = existing,
+    mapleader = vim.g.mapleader or '',
+    maplocalleader = vim.g.maplocalleader or '',
+    mapped_keys = mapped_keys(),
+  }
+
+  local function on_output(output)
+    local code = table.concat(output_lines(output), '\n')
+    local ok, err = compiles(code)
+    if not ok then
+      return 'the generated Lua does not compile, so nothing was added ('
+        .. tostring(err) .. '); rerun the command',
+        vim.log.levels.ERROR
+    end
+
+    local opened, open_err = pcall(vim.cmd, 'split ' .. vim.fn.fnameescape(path))
+    if not opened then
+      return 'could not open ' .. path .. ': ' .. tostring(open_err), vim.log.levels.ERROR
+    end
+    local buf = vim.api.nvim_get_current_buf()
+    if not vim.bo[buf].modifiable then
+      return path .. ' is not modifiable', vim.log.levels.ERROR
+    end
+
+    local lines = { '-- ' .. prompt }
+    vim.list_extend(lines, vim.split(code, '\n', { plain = true }))
+    local count = vim.api.nvim_buf_line_count(buf)
+    local current = vim.api.nvim_buf_get_lines(buf, 0, -1, true)
+    local start = count
+    if count == 1 and current[1] == '' then
+      -- A new or empty file: begin with the header rather than a blank line.
+      start = 0
+      local with_header = vim.deepcopy(KEYMAPS_HEADER)
+      table.insert(with_header, '')
+      vim.list_extend(with_header, lines)
+      lines = with_header
+    else
+      table.insert(lines, 1, '')
+    end
+    break_undo(buf)
+    -- One call, so `u` removes the whole draft in one step.
+    vim.api.nvim_buf_set_lines(buf, start, start == 0 and -1 or start, true, lines)
+    vim.api.nvim_win_set_cursor(0, { start + (start == 0 and #KEYMAPS_HEADER + 2 or 2), 0 })
+    return string.format(
+      'appended %d line(s) to %s; review them, then :w to keep and activate the mapping, or u to discard',
+      #lines,
+      vim.fn.fnamemodify(path, ':t')
+    )
+  end
+
+  send(KEYMAP_KEY, payload, on_output, 'drafting a key mapping …', 'the helper produced no Lua')
 end
 
 -- ------------------------------------------------------------------- setup
@@ -498,14 +661,17 @@ local function register(name, handler, description)
   return true
 end
 
---- Register both Ex commands.
+--- Register the Ex commands and load the mappings file.
 ---
---- Pass `{ command = 'OtherName' }` or `{ fix_command = 'OtherName' }` if a name
---- is already taken.
+--- Pass `{ command = 'OtherName' }`, `{ fix_command = 'OtherName' }`, or
+--- `{ map_command = 'OtherName' }` if a name is already taken, and
+--- `{ keymaps_file = '/path/to/file.lua' }` to keep drafted mappings elsewhere
+--- than `stdpath('config')/texman-keymaps.lua`.
 function M.setup(opts)
   opts = opts or {}
   local name = opts.command or DEFAULT_COMMAND
   local fix_name = opts.fix_command or DEFAULT_FIX_COMMAND
+  local map_name = opts.map_command or DEFAULT_MAP_COMMAND
 
   local ok = register(name, function(cmd)
     M.request(cmd.args)
@@ -527,6 +693,33 @@ function M.setup(opts)
   }) then
     M.fix_command_name = fix_name
   end
+
+  if opts.keymaps_file then
+    M.keymaps_file = vim.fn.fnamemodify(vim.fn.expand(opts.keymaps_file), ':p')
+  end
+  if register(map_name, function(cmd)
+    M.map(cmd.args)
+  end, {
+    nargs = '+',
+    desc = 'Draft a key mapping from a description into the texman mappings file',
+  }) then
+    M.map_command_name = map_name
+  end
+
+  -- Writing the mappings file is how a drafted mapping is accepted, so that is
+  -- when it takes effect. Comparing resolved paths avoids autocmd-pattern
+  -- escaping for unusual characters in the config path.
+  local group = vim.api.nvim_create_augroup('texman', { clear = true })
+  vim.api.nvim_create_autocmd('BufWritePost', {
+    group = group,
+    callback = function(event)
+      local written = vim.fn.resolve(vim.fn.fnamemodify(event.file, ':p'))
+      if written == vim.fn.resolve(keymaps_path()) and M.load_keymaps() then
+        notify('mappings from ' .. vim.fn.fnamemodify(written, ':t') .. ' are active')
+      end
+    end,
+  })
+  M.load_keymaps()
   return true
 end
 

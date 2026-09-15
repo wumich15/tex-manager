@@ -2,7 +2,8 @@
 
 `texman` is a personal LaTeX file manager: a terminal catalog of the `.tex` and
 `.sty` files already on the machine, a description per file, Neovim as the
-editor, and a `:TexAI <line> <prompt>` command that inserts generated LaTeX.
+editor, a `:TexAI <line> <prompt>` command that inserts generated LaTeX, and a
+`:TexAIMap <prompt>` command that drafts a Neovim key mapping.
 
 **The plan in this file has been implemented.** Everything in
 "What the first version does" works and is verified as described under
@@ -12,12 +13,14 @@ anything non-trivial; it explains the design decisions and the invariants below.
 
 ## What the first version does
 
-1. `texman` opens a terminal UI and scans the computer for `.tex` and `.sty`
-   files, showing their containing directories and files in one searchable
-   catalog, grouped by directory.
+1. `texman` opens a terminal UI and scans `~/Documents` and `~/Downloads` for
+   `.tex` and `.sty` files, showing their containing directories and files in
+   one searchable catalog, grouped by directory. `--root DIRECTORY`, repeatable,
+   scans somewhere else instead.
 2. The user can select a file, add or edit a description, see that description in
    the terminal, and open the file in Neovim. Descriptions survive restarts and
-   rescans.
+   rescans. `i` hides a directory and everything under it from the catalog, and
+   shows it again; scans skip what is hidden.
 3. While editing a TeX file in Neovim, `:TexAI <line> <prompt>` inserts generated
    LaTeX before that line, for example
    `:TexAI 25 Add a TikZ diagram of a three-node directed cycle`.
@@ -27,6 +30,18 @@ anything non-trivial; it explains the design decisions and the invariants below.
 4. Snippets are generated through the OpenAI API using the user's own API key.
 5. Everything is suitable for one person's local use. No accounts, hosted
    backend, synchronization, telemetry, or multi-user features.
+6. The TUI takes Vim-style motions with counts: `5j`, `3k`, `gg`, `G`, `h`/`l`
+   to switch panes, and `;s` / `;a` for the next / previous directory. Added at
+   the user's request after the first version.
+7. `p` creates and opens a `preamble.tex` template; `n` creates a new `.tex`
+   document from it, in a directory the user types, defaulting to the
+   directory under the cursor. Also added at the user's request.
+8. `:TexAIMap <prompt>` asks the model for a Neovim key mapping (for example an
+   insert-mode shortcut that types `\begin{enumerate} \item \end{enumerate}`
+   and leaves the cursor after `\item`), appends the Lua to
+   `~/.config/nvim/texman-keymaps.lua` in a split for review, and activates it
+   when that file is written. `init.lua` is never edited. Also added at the
+   user's request.
 
 "One place" means a catalog of the original files. Do not move or copy them:
 relative `\input`, `\include`, images, and style references must keep working.
@@ -39,11 +54,13 @@ texman/
   __init__.py             # version only
   cli.py                  # texman, texman scan, internal texman ai
   index.py                # filesystem traversal and SQLite persistence
-  tui.py, tui.tcss        # directory/file browser and description editor
-  ai.py                   # request validation and OpenAI snippet generation
-nvim/texman.lua           # :TexAI command
+  documents.py            # preamble.tex template and new documents from it
+  tui.py, tui.tcss        # directory/file browser, description editor, dialogs
+  ai.py                   # request validation and OpenAI generation (3 modes)
+nvim/texman.lua           # :TexAI, :TexAIFix, :TexAIMap
 tests/
   test_index.py           # walk + catalog, against a temporary fixture
+  test_documents.py       # template and document creation, in a temp dir
   test_ai.py              # request contract, with a stubbed client
   test_tui.py             # headless Textual pilot, with nvim stubbed
   test_cli.py             # the installed command, as a real subprocess
@@ -76,10 +93,21 @@ tests still pass.
 - **Rows are never deleted.** A missing file keeps its row and description and
   displays as unavailable. A stopped or interrupted scan loses nothing.
   Automatic deletion and rename tracking remain out of scope.
+- **Ignoring hides, it never deletes.** An `ignored_dirs` row hides a directory
+  and everything under it, by whole path segments (`/a/b` hides `/a/b/c`, not
+  `/a/bc`). Rows and descriptions survive untouched and come back exactly as
+  they were. Ignored directories stay visible in the directory pane, under a
+  separator, or nobody could restore them; selecting one shows the tree it
+  hides, because the ignore filter applies to the aggregate view only. Ignoring
+  or unignoring a directory already covered by an ignored parent is refused and
+  explained, never silently applied.
 - **Identities are absolute canonical paths**, extensions are matched
   case-insensitively and stored lowercased, and all SQL is parameterized.
 - **Discovery reads metadata only** — no file contents, no network. The scan
-  root defaults to `/`.
+  roots default to `~/Documents` and `~/Downloads`; `--root` overrides them and
+  may be repeated. One walk spans every root with a shared visited set, so a
+  file reachable from two roots is catalogued once. A missing *default* root is
+  dropped, a missing *named* root is a clean error.
 - **Only virtual and auto-mounting trees are excluded** (`/dev`, `/proc`, `/sys`,
   `/net`, `/home`), and the summary names the ones that applied. Do not broadly
   exclude system libraries, hidden folders, or caches: they contain TeX files.
@@ -94,7 +122,23 @@ tests still pass.
   cooperatively between directories. SQLite connections stay owned by the thread
   that created them; writes are batched in short transactions with a busy
   timeout.
-- **Letter shortcuts never fire while a text input has focus.**
+- **Letter shortcuts never fire while a text input has focus.** That includes
+  the Vim motions and count digits: `on_key` clears its state and returns while
+  an `Input` or a modal dialog has focus.
+- **A consumed motion key never reaches a binding.** Counts and `;`/`g`
+  sequences live in `TexmanApp.on_key`, which Textual runs before the App's
+  binding check; every consumed key gets `prevent_default()` and `stop()`, so
+  the `s` of `;s` never stops a scan. A non-motion key drops the count and
+  proceeds to its binding; an unknown sequence is reported and does nothing;
+  Escape cancels a pending sequence. Plain arrow keys stay with the widgets.
+- **Directory motions skip the disabled `── ignored ──` separator.**
+- **`i` acts on the directory in context** — the highlighted directory when the
+  left pane has focus, otherwise the selected table row's directory. `n` uses
+  the same rule to prefill the directory, falling back to the first scan root.
+- **Creating a document never overwrites anything.** The file is opened with
+  mode `x`, an existing file is a clean error, and `p` never rewrites an
+  existing `preamble.tex`. A typed directory may be created; a name may not
+  contain a path separator. The new file is upserted into the catalog at once.
 - **The UI stays responsive on a whole-machine catalog.** Redraws during a scan
   are paced by the last measured redraw cost (four times it, at least 0.5 s);
   the directory list is rebuilt only when the directory set changed; saving a
@@ -128,6 +172,15 @@ tests still pass.
   total, nearby text kept longest. Never read other indexed files or follow
   `\input`. Buffer text is document context, not instructions.
 - **Never display or log the key or the full request body.**
+- **`:TexAIMap` never edits `init.lua` and never runs unreviewed code.** Drafts
+  go to the mappings file `setup()` loads. The helper's Lua is compiled with
+  `loadstring` and refused if it fails, then appended to the file in a split
+  as one undoable change and left unsaved: `:w` accepts it, `u` discards it.
+  `load_keymaps` runs the file only at startup and after a write, clearing the
+  `texman_keymaps` augroup first and wrapping `dofile` in `pcall`, so a broken
+  mapping is reported and can never stop Neovim from starting. The keymap
+  request sends only the prompt, the mappings file, the leader keys, and the
+  left-hand sides of existing mappings.
 - **`:TexAIFix` must never make a wrong edit.** It refuses an unsaved buffer,
   because log line numbers describe the file on disk. It refuses when the first
   error belongs to another file, naming that file. It refuses a blamed line
@@ -155,9 +208,12 @@ tests still pass.
 ## Verifying changes
 
 ```sh
-python -m unittest discover -s tests -t .       # 127 checks
-nvim --headless -u NONE -l tests/test_nvim.lua  # 107 checks
+python -m unittest discover -s tests -t .       # 213 checks
+nvim --headless -u NONE -l tests/test_nvim.lua  # 146 checks
 ```
+
+`python` here means the project's `.venv/bin/python`; the system `python3` on
+the development machine lacks `openai` and fails three `test_ai.py` checks.
 
 Automated tests use only a temporary fixture — never the developer's whole
 machine — and always stub the OpenAI client, so they make no paid API calls.
@@ -168,11 +224,11 @@ case-variant fixture names must live in different directories.
 
 Manual checks, when touching the relevant area:
 
-- A real scan from `/` stays responsive, reports inaccessible paths, and groups
-  files under their directories. Last measured: 42 s, 569,833 directories,
-  24,180 files, 557 skipped. With that catalog cached and a full scan running,
-  the UI's median event-loop tick stayed at 0.10 s with a 1.5 s worst-case
-  hiccup during a table rebuild.
+- A real scan stays responsive, reports inaccessible paths, and groups files
+  under their directories. Last measured from `/`: 42 s, 569,833 directories,
+  24,180 files, 557 skipped. The default roots are far smaller. With that
+  catalog cached and a full scan running, the UI's median event-loop tick
+  stayed at 0.10 s with a 1.5 s worst-case hiccup during a table rebuild.
 - `texman --help` works from a directory other than the repository.
 - A path containing spaces opens in Neovim and returns to the TUI.
 - File management works with both API variables unset.
@@ -182,6 +238,10 @@ Manual checks, when touching the relevant area:
   project with `TEXMAN_OPENAI_MODEL=gpt-5.6-luna`; see the README. Mocked output
   alone never proves API connectivity, so redo this check by hand if the request
   path changes.
+- One real `:TexAIMap` request: the draft compiles, lands in the mappings file
+  unsaved, and works after `:w`. **Done** for the enumerate example with the
+  same model, through headless Neovim and a scratch mappings file; see the
+  README.
 
 ## Do not add
 
@@ -190,8 +250,14 @@ document parser, streaming protocol, or automatic LaTeX compiler. Manual refresh
 and one API request per prompt are enough. `:TexAIFix` *reads* a log the user's
 own compiler already produced; it never runs the compiler itself.
 
-Also deferred on purpose: bulk actions, tags, favorites, file operations,
-configurable scan exclusions, stale-row pruning, rename tracking, Windows
-support, and installer packaging. `:TexAIFix` fixes one line from one error; it
-does not iterate, recompile, or repair a whole document. The complete personal
-workflow works; do not expand scope further without being asked.
+Also deferred on purpose: bulk actions, tags, favorites, file operations other
+than creating a document from the template, stale-row pruning, rename tracking,
+Windows support, and installer packaging. Ignoring directories is now in scope,
+at the user's request, but only as the manual per-directory toggle described
+above: no patterns, no globs, no configuration file. `:TexAIFix` fixes one line
+from one error; it does not iterate, recompile, or repair a whole document.
+`:TexAIMap` drafts one mapping per request into one file; it does not edit
+`init.lua`, manage plugins, or run code the user has not saved. The Vim
+motions are the ones listed; there is no general keymap layer or rebinding.
+The complete personal workflow works; do not expand scope further without
+being asked.

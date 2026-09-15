@@ -3,8 +3,9 @@
 `texman` is a personal file manager for LaTeX files, with AI help for diagrams
 and other hard-to-TeX stuff.
 
-It scans your computer for `.tex` and `.sty` files and shows them in one
-searchable terminal catalog, grouped by directory. You can describe any file in
+It scans `~/Documents` and `~/Downloads` for `.tex` and `.sty` files and shows
+them in one searchable terminal catalog, grouped by directory. `--root` points
+it somewhere else, or at several places at once. You can describe any file in
 your own words, open it in Neovim, and — while editing — ask for a generated
 LaTeX fragment with `:TexAI <line> <prompt>`.
 
@@ -16,17 +17,24 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for how it works internally.
 
 ## What it does
 
-- One catalog of every `.tex` and `.sty` file the current user can read,
-  including hidden folders, project directories, `/Volumes`, and installed TeX
-  trees.
+- One catalog of every `.tex` and `.sty` file under `~/Documents` and
+  `~/Downloads`, including hidden folders and nested project directories.
 - A description per file that survives restarts, rescans, stopped scans, and
   files that go missing.
+- Directories you can ignore with one key, hiding a whole project tree from the
+  catalog and from future scans, and restore just as easily.
 - Enter opens the selected file in Neovim, in its own directory, and returns you
   to the same place in the catalog.
+- Vim-style movement: `5j`, `3k`, `gg`, `G`, and `;s` to jump to the next
+  directory.
+- A `preamble.tex` template of your own, and `n` to start a new document from
+  it in any directory.
 - `:TexAI 25 Add a TikZ diagram of a three-node directed cycle` inserts
   generated LaTeX before line 25 of the buffer you are editing.
 - `:TexAIFix` reads your compiler's log, finds the line LaTeX complained about,
   and replaces it with a corrected version.
+- `:TexAIMap a shortcut for an enumerate environment with the cursor after the
+  first \item` drafts a Neovim key mapping into a file you review and save.
 
 ## Requirements
 
@@ -80,32 +88,100 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for how it works internally.
 
 ```sh
 texman                      # open the catalog and scan in the background
-texman scan                 # scan without the UI, starting at /
-texman scan --root ~/papers # a smaller scan, for a quick try
+texman scan                 # scan without the UI
+texman --root ~/papers      # the UI, scanning one directory instead
+texman scan --root ~/papers --root /usr/local/texlive   # two roots, no UI
 ```
+
+By default both scan `~/Documents` and `~/Downloads`, which is where your own
+documents live; scanning from `/` instead works, but buries them under tens of
+thousands of TeX Live package files. `--root` replaces the defaults and can be
+repeated. A default folder you do not have is skipped quietly; a folder you name
+yourself has to exist, or the command says so and stops.
 
 Cached results appear immediately and a full scan starts in the background.
 
 | Key | Action |
 | --- | --- |
 | Arrow keys, Tab | Move the selection, switch panes |
+| `j` / `k` | Move down / up; a count first repeats it (`5j`, `3k`, `4↓`) |
+| `gg` / `G` | First / last row; `7G` goes to row 7 |
+| `h` / `l` | Focus the directory pane / the file table |
+| `;s` / `;a` | Jump to the next / previous directory (`2;s` skips one) |
 | `/` | Filter by path or description (case-insensitive substring) |
 | Enter | Open the selected file in Neovim |
 | `d` | Edit the selected file's description |
+| `n` | Create a new document from `preamble.tex` |
+| `p` | Edit `preamble.tex`, creating it first if needed |
+| `i` | Ignore the directory in context, or show it again |
 | `r` | Start a full rescan |
 | `s` | Stop the running scan |
 | `q` | Quit |
-| Escape | Cancel a dialog, or leave the filter |
+| Escape | Cancel a dialog, a pending `;` or count, or leave the filter |
+
+Counts and two-key sequences work the way they do in Vim: type the digits, then
+the motion. A key that is not a motion drops the count and does its usual job,
+and nothing here fires while you are typing in the filter or a dialog. In the
+"All directories" view `;s` moves to the first file of the next directory group;
+when a single directory is selected it moves the left pane to the next
+directory instead, so the table follows.
 
 The status line shows the current directory, how many files have been found, and
-how many paths were skipped. Skipped paths are normally folders macOS protects.
-To cover more of the disk, grant your terminal Full Disk Access in System
-Settings → Privacy & Security and press `r` to rescan. Unmounted drives cannot
-be scanned. A scan you stop is incomplete, not failed: everything already found,
-and every description, is kept.
+how many paths were skipped. Skipped paths are normally folders macOS protects —
+including `~/Documents` and `~/Downloads` themselves, which macOS guards
+separately. If a scan finds nothing at all, grant your terminal access when
+macOS asks, or give it Full Disk Access in System Settings → Privacy & Security,
+and press `r` to rescan. Unmounted drives cannot be scanned. A scan you stop is
+incomplete, not failed: everything already found, and every description, is
+kept.
+
+### Ignoring directories you do not want to see
+
+Press `i` to hide a directory: the one highlighted in the left pane, or the one
+the selected file belongs to. It disappears from the catalog along with every
+subdirectory beneath it, and scans stop entering it — useful for a
+`node_modules` full of vendored `.tex` files, a finished course folder, or a
+backup tree.
+
+Nothing is deleted. Ignored directories stay listed at the bottom of the left
+pane under `── ignored ──`, labelled with how many files they hide. Select one
+to see exactly what it is hiding, and press `i` again to bring it back, with
+every description exactly as you left it.
+
+One entry covers a whole tree, so if you press `i` on a directory whose parent
+is already ignored, texman says which parent hides it instead of adding a second
+rule. A scan already in progress finishes with the rules it started with; press
+`r` afterwards if you want it to take effect immediately.
 
 The catalog lives in `${XDG_DATA_HOME:-~/.local/share}/texman/index.sqlite3`,
 outside this repository.
+
+### Starting a new document from your preamble
+
+Press `p` once to create `preamble.tex` and open it in Neovim. It starts with a
+plain `article` preamble; make it yours. It lives at
+`${XDG_CONFIG_HOME:-~/.config}/texman/preamble.tex`, or wherever
+`TEXMAN_PREAMBLE` or `--preamble PATH` points, and `p` never overwrites it once
+it exists.
+
+Press `n` to create a document. The dialog asks for a file name (`.tex` is added
+if you leave it off) and a directory, prefilled with the directory of the file
+under the cursor, or the highlighted directory when the left pane has focus.
+Type another directory to put the file elsewhere; `~` works, and a directory
+that does not exist yet is created. The new file is a copy of your preamble
+followed by
+
+```latex
+\begin{document}
+
+\end{document}
+```
+
+unless the preamble already contains `\begin{document}`, in which case it is
+used verbatim as a whole skeleton. The document is catalogued immediately,
+selected, and opened in Neovim. An existing file is never overwritten, and if
+you have no `preamble.tex` yet the built-in default is used and the message
+says so.
 
 ## Set up the AI helper
 
@@ -153,6 +229,10 @@ File management needs neither of these variables; `:TexAI` needs both.
    ```lua
    require('texman').setup({ command = 'TexGen' })
    ```
+
+   `fix_command` and `map_command` rename `:TexAIFix` and `:TexAIMap` the same
+   way. `setup` also loads `~/.config/nvim/texman-keymaps.lua`, the file
+   `:TexAIMap` writes to; `keymaps_file = '/some/other/path.lua'` moves it.
 
 ## Generating LaTeX
 
@@ -222,6 +302,47 @@ The rules are deliberately careful, because a wrong edit is worse than no edit:
   there are no errors when the build died.
 - One undo step, and nothing is written to disk until you `:write`.
 
+## Adding a key mapping
+
+Describe the shortcut you want, in any TeX buffer or none:
+
+```vim
+:TexAIMap a keybind for \begin{itemize} with two \item lines and \end{itemize}, leaving the cursor after the first \item
+```
+
+The model drafts Lua for it, and texman opens `texman-keymaps.lua` in a split
+with the draft appended, so you read the code before Neovim ever runs it. This
+is the real draft that request produced:
+
+```lua
+-- a keybind for \begin{itemize} with two \item lines and \end{itemize}, leaving the cursor after the first \item
+-- Add an insert-mode <Tab>e keybind for a LaTeX itemize environment with two \item lines, leaving the cursor after the first \item.
+vim.api.nvim_create_autocmd('FileType', {
+  pattern = { 'tex', 'plaintex' },
+  group = 'texman_keymaps',
+  callback = function(args)
+    vim.keymap.set('i', '<Tab>e', '\\begin{itemize}<CR>\\item <CR>\\item <CR>\\end{itemize}<Up><Up><End>', {
+      buffer = args.buf,
+      desc = 'Insert itemize environment',
+    })
+  end,
+})
+```
+
+Read it before you save: a draft is a suggestion, and cursor placement in
+particular is worth checking. `:w` keeps it and makes it active at once; `u`
+discards it. Name a key in the
+request if you have one in mind (`... on <leader>e`); otherwise the model picks
+one that is not already mapped, following the style of your existing mappings,
+and says which in the comment.
+
+Your `init.lua` is never edited. `require('texman').setup()` runs the mappings
+file at startup and again every time you write it, inside `pcall`, so a mapping
+that fails to load is reported instead of breaking Neovim. Lua that does not
+compile is refused before anything is appended. The request sends only your
+description, the current contents of that file, your leader keys, and the list
+of keys already mapped (left-hand sides only) so the draft avoids them.
+
 ## Try the whole workflow
 
 1. Run `texman` and wait for files to appear.
@@ -235,8 +356,8 @@ The rules are deliberately careful, because a wrong edit is worse than no edit:
 ## Tests
 
 ```sh
-python -m unittest discover -s tests -t .     # 101 checks
-nvim --headless -u NONE -l tests/test_nvim.lua  # 58 checks
+python -m unittest discover -s tests -t .       # 213 checks
+nvim --headless -u NONE -l tests/test_nvim.lua  # 146 checks
 ```
 
 Automated tests only scan a temporary fixture, never your whole machine, and the
@@ -248,6 +369,7 @@ OpenAI client is always stubbed, so they make no paid API calls.
   machine: 569,833 directories walked, 24,180 files catalogued, 557 paths
   skipped and reported, with the excluded roots (`/dev`, `/home`) named in the
   summary. Stopping a scan with Ctrl-C reported it as stopped, not complete.
+  The default roots are a small fraction of that.
 - `texman --help` works from a directory other than the repository.
 
 ### Verified with a live request
@@ -274,3 +396,19 @@ One real `:TexAI` request against a live OpenAI project, with
   as a fatal `File ended while scanning use of \frac` with **no line number**,
   was located through the runaway-argument text. The fix added the one missing
   brace, and the document then compiled to a PDF with no errors.
+
+`:TexAIMap` was verified with two live requests, run through headless Neovim
+against a scratch mappings file, with the same model:
+
+- The first asked for `\begin{enumerate} \item \end{enumerate}` with the
+  cursor after `\item`. The draft was a `tex`-only insert mapping on `<Tab>e`,
+  in the same style as the `<Tab>l` mapping already in the author's
+  `init.lua`; it compiled, was appended unsaved as one undoable change, and
+  was active after `:w`. Typing it in a `tex` buffer inserted the right three
+  lines, but its cursor move was `<Esc>2kA`, one line too far: the model had
+  counted from below the snippet rather than from its last line. That is the
+  kind of slip the review step exists for, and the instructions now spell out
+  how to count cursor moves.
+- The second, the itemize request shown above, was made after that change. Its
+  draft used `<Up><Up><End>`, and typing `<Tab>e` in a `tex` buffer left the
+  cursor exactly after the first `\item `.

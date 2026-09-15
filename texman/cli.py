@@ -46,14 +46,33 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="SQLite catalog to use (default: $XDG_DATA_HOME/texman/index.sqlite3)",
     )
+    parser.add_argument(
+        "--root",
+        action="append",
+        dest="roots",
+        metavar="DIRECTORY",
+        help="directory to scan; repeat for several (default: ~/Documents and ~/Downloads)",
+    )
+    parser.add_argument(
+        "--preamble",
+        metavar="PATH",
+        help=(
+            "preamble.tex template for new documents "
+            "(default: $TEXMAN_PREAMBLE or $XDG_CONFIG_HOME/texman/preamble.tex)"
+        ),
+    )
     sub = parser.add_subparsers(dest="command")
 
     scan = sub.add_parser("scan", help="scan for .tex and .sty files without the UI")
     scan.add_argument(
         "--root",
-        default="/",
+        action="append",
+        dest="roots",
         metavar="DIRECTORY",
-        help="directory to scan (default: / , the whole accessible computer)",
+        # SUPPRESS, because a subparser default otherwise overwrites a --root
+        # that was given before the subcommand.
+        default=argparse.SUPPRESS,
+        help="directory to scan; repeat for several (default: ~/Documents and ~/Downloads)",
     )
     scan.add_argument(
         "--quiet", action="store_true", help="print only the final summary"
@@ -61,19 +80,49 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser(
         "ai",
-        help="internal: read one JSON request on stdin, write a LaTeX snippet to stdout",
+        help="internal: read one JSON request on stdin, write the generated text to stdout",
     )
     return parser
 
 
-def _run_scan(args: argparse.Namespace) -> int:
+def _resolve_roots(args: argparse.Namespace) -> list[str] | str:
+    """Return the roots to walk, or a message explaining why there are none.
+
+    Roots the user named are checked one by one, because a typo should be
+    reported rather than quietly skipped. The defaults are filtered instead:
+    a machine without `~/Documents` should still scan `~/Downloads`.
+    """
     import os
 
     from . import index
 
-    if not os.path.isdir(args.root):
-        what = "is not a directory" if os.path.exists(args.root) else "does not exist"
-        print(f"texman: scan root {args.root!r} {what}", file=sys.stderr)
+    given = getattr(args, "roots", None)
+    if given:
+        for root in given:
+            if not os.path.isdir(root):
+                what = "is not a directory" if os.path.exists(root) else "does not exist"
+                return f"texman: scan root {root!r} {what}"
+        return index.normalise_roots(given)
+
+    roots = index.default_scan_roots()
+    if not roots:
+        wanted = ", ".join(
+            index.display_path(os.path.join(os.path.expanduser("~"), name))
+            for name in index.DEFAULT_SCAN_ROOT_NAMES
+        )
+        return (
+            f"texman: none of the default scan roots exist ({wanted}). "
+            "Pass --root DIRECTORY to scan somewhere else."
+        )
+    return roots
+
+
+def _run_scan(args: argparse.Namespace) -> int:
+    from . import index
+
+    roots = _resolve_roots(args)
+    if isinstance(roots, str):
+        print(roots, file=sys.stderr)
         return 2
 
     last = [0.0]
@@ -103,7 +152,7 @@ def _run_scan(args: argparse.Namespace) -> int:
 
     try:
         stats = index.run_scan(
-            args.root,
+            roots,
             db_path=args.db,
             on_progress=on_progress,
             should_cancel=stop.is_set,
@@ -130,7 +179,12 @@ def _run_scan(args: argparse.Namespace) -> int:
 def _run_tui(args: argparse.Namespace) -> int:
     from .tui import TexmanApp
 
-    app = TexmanApp(db_path=args.db)
+    roots = _resolve_roots(args)
+    if isinstance(roots, str):
+        print(roots, file=sys.stderr)
+        return 2
+
+    app = TexmanApp(db_path=args.db, scan_roots=roots, preamble_path=args.preamble)
     try:
         app.run()
     except sqlite3.Error as exc:

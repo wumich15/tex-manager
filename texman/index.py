@@ -28,6 +28,11 @@ EXCLUDED_ROOTS = (
     "/home",  # macOS autofs trigger
 )
 
+# Scanning from `/` catalogues tens of thousands of TeX Live package files that
+# nobody edits by hand. The default roots are the two directories where a
+# person's own documents actually live; `--root` overrides them, repeatably.
+DEFAULT_SCAN_ROOT_NAMES = ("Documents", "Downloads")
+
 DEFAULT_BATCH_SIZE = 200
 BUSY_TIMEOUT_MS = 5000
 MAX_SKIPPED_SAMPLES = 20
@@ -41,6 +46,10 @@ CREATE TABLE IF NOT EXISTS files (
     last_seen TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS files_parent_dir ON files (parent_dir);
+CREATE TABLE IF NOT EXISTS ignored_dirs (
+    path TEXT PRIMARY KEY,
+    ignored_at TEXT NOT NULL
+);
 """
 
 
@@ -62,6 +71,28 @@ def default_db_path() -> Path:
     if override:
         return Path(override)
     return data_dir() / "index.sqlite3"
+
+
+def default_scan_roots() -> list[str]:
+    """Return the default scan roots, keeping only those that exist.
+
+    A missing `~/Documents` or `~/Downloads` is not an error worth refusing to
+    start over: the remaining root is still scanned, and the caller reports it
+    when nothing is left.
+    """
+    home = os.path.expanduser("~")
+    candidates = [os.path.join(home, name) for name in DEFAULT_SCAN_ROOT_NAMES]
+    return [path for path in candidates if os.path.isdir(path)]
+
+
+def display_path(path: str) -> str:
+    """Abbreviate the home directory, so summaries and the status line stay short."""
+    home = os.path.expanduser("~")
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
 
 
 def connect(db_path: str | os.PathLike[str] | None = None) -> sqlite3.Connection:
@@ -132,10 +163,11 @@ class CatalogEntry:
 class ScanStats:
     """Outcome of one traversal. A stopped scan is incomplete, not successful."""
 
-    root: str = "/"
+    roots: list[str] = field(default_factory=list)
     files_found: int = 0
     dirs_visited: int = 0
     skipped: int = 0
+    ignored: int = 0
     skipped_samples: list[str] = field(default_factory=list)
     excluded_roots: list[str] = field(default_factory=list)
     cancelled: bool = False
@@ -153,9 +185,12 @@ class ScanStats:
         details = [f"{self.files_found} file(s) in {self.dirs_visited} directories"]
         if self.skipped:
             details.append(f"{self.skipped} path(s) skipped (permissions or removed)")
+        if self.ignored:
+            details.append(f"{self.ignored} ignored directory(ies) not entered")
         if self.excluded_roots:
             details.append("excluded: " + ", ".join(self.excluded_roots))
-        return f"Scan of {self.root} {state}: " + "; ".join(details)
+        where = ", ".join(display_path(root) for root in self.roots) or "nothing"
+        return f"Scan of {where} {state}: " + "; ".join(details)
 
     def note_skip(self, path: str) -> None:
         self.skipped += 1
@@ -186,38 +221,66 @@ def matches(name: str) -> bool:
     return matched_extension(name) is not None
 
 
-def _excluded_for(root: str) -> list[str]:
-    """Excluded roots that actually sit underneath the requested root."""
-    root = os.path.abspath(root)
-    return [
-        item
-        for item in EXCLUDED_ROOTS
-        if os.path.isdir(item) and (item == root or item.startswith(root.rstrip("/") + "/"))
-    ]
+def _excluded_for(roots: Sequence[str]) -> list[str]:
+    """Excluded roots that actually sit underneath one of the requested roots."""
+    found = set()
+    for root in roots:
+        root = os.path.abspath(root)
+        found.update(
+            item
+            for item in EXCLUDED_ROOTS
+            if os.path.isdir(item)
+            and (item == root or item.startswith(root.rstrip("/") + "/"))
+        )
+    return sorted(found)
+
+
+def normalise_roots(
+    roots: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
+) -> list[str]:
+    """Return absolute roots in the given order, without repeats.
+
+    A single path is accepted as well as a sequence, so one root stays the easy
+    case for callers and tests.
+    """
+    if isinstance(roots, (str, os.PathLike)):
+        roots = [roots]
+    ordered: list[str] = []
+    for item in roots:
+        path = os.path.abspath(os.fspath(item))
+        if path not in ordered:
+            ordered.append(path)
+    return ordered
 
 
 def walk_tree(
-    root: str | os.PathLike[str],
+    roots: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
     stats: ScanStats,
     *,
+    ignored: Sequence[str] = (),
     should_cancel: Callable[[], bool] | None = None,
     on_progress: Callable[[ScanStats], None] | None = None,
     progress_interval: float = 0.25,
 ) -> Iterator[FileRecord]:
-    """Yield matching files under `root`, inspecting names and metadata only.
+    """Yield matching files under `roots`, inspecting names and metadata only.
 
     Directory symlinks are not followed and device/inode pairs are remembered,
-    so filesystem aliases are visited once. Permission errors and entries that
-    vanish mid-walk are counted and skipped rather than raised.
+    so filesystem aliases are visited once -- and because those sets span every
+    root, a file reachable from two of them is still yielded once. Permission
+    errors and entries that vanish mid-walk are counted and skipped rather than
+    raised.
     """
-    root = os.path.abspath(os.fspath(root))
-    stats.root = root
-    excluded = set(_excluded_for(root))
+    resolved = normalise_roots(roots)
+    ignored_dirs = normalise_roots(ignored) if ignored else []
+    stats.roots = list(resolved)
+    excluded = set(_excluded_for(resolved))
     stats.excluded_roots = sorted(excluded)
 
     visited: set[tuple[int, int]] = set()
     seen_files: set[str] = set()
-    pending: list[str] = [root]
+    # Reversed, because directories are popped from the end: the first root
+    # given is the first one walked.
+    pending: list[str] = list(reversed(resolved))
     last_progress = 0.0
 
     while pending:
@@ -226,6 +289,11 @@ def walk_tree(
             return
         directory = pending.pop()
         if directory in excluded:
+            continue
+        if ignored_dirs and is_ignored(directory, ignored_dirs):
+            # Pruned at the top, so the count is one per ignored tree entered,
+            # not one per directory inside it.
+            stats.ignored += 1
             continue
         try:
             key = os.stat(directory, follow_symlinks=False)
@@ -357,24 +425,94 @@ def _entry(row: sqlite3.Row) -> CatalogEntry:
     )
 
 
-def list_directories(conn: sqlite3.Connection) -> list[tuple[str, int]]:
+def covering_ignore(path: str, ignored: Sequence[str]) -> str | None:
+    """The ignored directory that hides `path`, or None.
+
+    Ignoring is a prefix rule: a directory hides everything beneath it, so one
+    entry covers a whole project tree. Comparison is on path segments, so
+    `/a/bc` is not hidden by `/a/b`.
+    """
+    path = os.path.abspath(path)
+    for prefix in ignored:
+        prefix = os.path.abspath(prefix)
+        if path == prefix or path.startswith(prefix.rstrip(os.sep) + os.sep):
+            return prefix
+    return None
+
+
+def is_ignored(path: str, ignored: Sequence[str]) -> bool:
+    return covering_ignore(path, ignored) is not None
+
+
+def list_ignored(conn: sqlite3.Connection) -> list[str]:
+    """Explicitly ignored directories, in display order."""
+    rows = conn.execute(
+        "SELECT path FROM ignored_dirs ORDER BY path COLLATE NOCASE"
+    ).fetchall()
+    return [row["path"] for row in rows]
+
+
+def ignore_directory(conn: sqlite3.Connection, path: str) -> bool:
+    """Ignore a directory and everything under it.
+
+    Returns False when it is already hidden, either by itself or by a parent.
+    Nothing is deleted: the rows and their descriptions stay, waiting to be
+    shown again.
+    """
+    target = os.path.abspath(path)
+    if is_ignored(target, list_ignored(conn)):
+        return False
+    with conn:
+        conn.execute(
+            "INSERT INTO ignored_dirs (path, ignored_at) VALUES (?, ?)",
+            (target, _timestamp()),
+        )
+    return True
+
+
+def unignore_directory(conn: sqlite3.Connection, path: str) -> bool:
+    """Stop ignoring a directory. False if it was not ignored in its own right.
+
+    A directory hidden only by an ignored parent is not unignored here: the
+    parent is what the user has to restore, and saying so beats quietly doing
+    nothing or, worse, unpicking a rule they did not name.
+    """
+    target = os.path.abspath(path)
+    with conn:
+        cursor = conn.execute("DELETE FROM ignored_dirs WHERE path = ?", (target,))
+    return cursor.rowcount > 0
+
+
+def list_directories(
+    conn: sqlite3.Connection, *, include_ignored: bool = False
+) -> list[tuple[str, int]]:
     """Directories that contain catalogued files, with their file counts."""
     rows = conn.execute(
         "SELECT parent_dir, COUNT(*) AS n FROM files GROUP BY parent_dir"
         " ORDER BY parent_dir COLLATE NOCASE"
     ).fetchall()
-    return [(row["parent_dir"], row["n"]) for row in rows]
+    pairs = [(row["parent_dir"], row["n"]) for row in rows]
+    if include_ignored:
+        return pairs
+    # Filtered here rather than in SQL: prefix matching is path semantics, not
+    # string semantics, and the ignore list is short.
+    ignored = list_ignored(conn)
+    return [pair for pair in pairs if not is_ignored(pair[0], ignored)]
 
 
 def list_files(
     conn: sqlite3.Connection,
     *,
     parent_dir: str | None = None,
+    under: str | None = None,
     query: str | None = None,
+    include_ignored: bool = False,
 ) -> list[CatalogEntry]:
     """Catalogued files, optionally restricted to a directory and a filter.
 
-    The filter is a case-insensitive substring match over path and description.
+    `parent_dir` matches one directory exactly; `under` matches a whole tree,
+    which is how an ignored directory shows what it is hiding. The filter is a
+    case-insensitive substring match over path and description.
     """
     sql = ["SELECT * FROM files"]
     clauses: list[str] = []
@@ -393,7 +531,16 @@ def list_files(
         sql.append("WHERE " + " AND ".join(clauses))
     sql.append("ORDER BY parent_dir COLLATE NOCASE, path COLLATE NOCASE")
     rows = conn.execute(" ".join(sql), params).fetchall()
-    return [_entry(row) for row in rows]
+    entries = [_entry(row) for row in rows]
+    if under is not None:
+        entries = [entry for entry in entries if is_ignored(entry.parent_dir, [under])]
+    if not include_ignored:
+        ignored = list_ignored(conn)
+        if ignored:
+            entries = [
+                entry for entry in entries if not is_ignored(entry.parent_dir, ignored)
+            ]
+    return entries
 
 
 def get_file(conn: sqlite3.Connection, path: str) -> CatalogEntry | None:
@@ -401,8 +548,10 @@ def get_file(conn: sqlite3.Connection, path: str) -> CatalogEntry | None:
     return _entry(row) if row else None
 
 
-def count_files(conn: sqlite3.Connection) -> int:
-    return int(conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+def count_files(conn: sqlite3.Connection, *, include_ignored: bool = False) -> int:
+    if include_ignored:
+        return int(conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+    return sum(count for _, count in list_directories(conn))
 
 
 # --------------------------------------------------------------------------
@@ -410,27 +559,39 @@ def count_files(conn: sqlite3.Connection) -> int:
 # --------------------------------------------------------------------------
 
 def run_scan(
-    root: str | os.PathLike[str] = "/",
+    roots: str | os.PathLike[str] | Sequence[str | os.PathLike[str]] | None = None,
     *,
     db_path: str | os.PathLike[str] | None = None,
     conn: sqlite3.Connection | None = None,
+    ignored: Sequence[str] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     on_progress: Callable[[ScanStats], None] | None = None,
     on_batch: Callable[[Sequence[FileRecord], ScanStats], None] | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> ScanStats:
-    """Walk `root` and commit discoveries in batches.
+    """Walk every root in `roots` and commit discoveries in batches.
 
-    The connection is created here unless one is supplied, so a worker thread
-    owns the connection it writes through.
+    Directories ignored in the UI are not entered; pass `ignored` explicitly to
+    override what the catalog says. The connection is created here unless one
+    is supplied, so a worker thread owns the connection it writes through.
     """
+    if roots is None:
+        roots = default_scan_roots()
     owned = conn is None
     connection = conn if conn is not None else connect(db_path)
+    if ignored is None:
+        # Read once, here: the directories to skip are catalog state, so every
+        # scan honours what the user hid in the UI without being told.
+        ignored = list_ignored(connection)
     stats = ScanStats()
     batch: list[FileRecord] = []
     try:
         for record in walk_tree(
-            root, stats, should_cancel=should_cancel, on_progress=on_progress
+            roots,
+            stats,
+            ignored=ignored,
+            should_cancel=should_cancel,
+            on_progress=on_progress,
         ):
             batch.append(record)
             if len(batch) >= batch_size:

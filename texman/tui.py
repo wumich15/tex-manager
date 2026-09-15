@@ -12,9 +12,10 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from typing import Sequence
 
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -33,10 +34,31 @@ from textual.widgets.data_table import CellDoesNotExist
 from textual.widgets.option_list import Option, OptionDoesNotExist
 from textual.worker import get_current_worker
 
-from . import index
+from . import documents, index
 
 ALL_DIRECTORIES = "\0all"
 HEADING_PREFIX = "\0dir:"
+IGNORED_SEPARATOR = "\0ignored"
+
+# Vim-style navigation: an optional count, then a motion. `;` and `g` start a
+# two-key sequence. `down` and `up` are listed so that a count applies to the
+# arrow keys too; without a count they are left to the widgets.
+MOTIONS = {
+    "j": "down",
+    "k": "up",
+    "down": "down",
+    "up": "up",
+    "G": "bottom",
+    "h": "directories",
+    "l": "files",
+}
+PREFIXES = {"semicolon": ";", "g": "g"}
+SEQUENCES = {
+    (";", "s"): "next_directory",
+    (";", "a"): "previous_directory",
+    ("g", "g"): "top",
+}
+COUNT_DIGITS = 4
 
 def display(text: str) -> str:
     """Make a name or description safe for a single-line table cell.
@@ -111,6 +133,41 @@ class DescriptionDialog(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class NewDocumentDialog(ModalScreen[tuple[str, str] | None]):
+    """Ask for a file name and a directory. Enter creates, Escape cancels."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, directory: str, template_note: str) -> None:
+        super().__init__()
+        self._directory = directory
+        self._template_note = template_note
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("New document from preamble.tex", id="dialog-title")
+            yield Input(placeholder="File name, e.g. notes.tex", id="document-name")
+            yield Input(value=self._directory, id="document-directory")
+            yield Label(self._template_note, id="dialog-note")
+            yield Label("Enter creates  ·  Tab switches fields  ·  Escape cancels",
+                        id="dialog-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#document-name", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        name = self.query_one("#document-name", Input).value
+        directory = self.query_one("#document-directory", Input).value
+        if not name.strip():
+            self.query_one("#document-name", Input).focus()
+            self.notify("Type a file name first.", severity="warning")
+            return
+        self.dismiss((name, directory))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # --------------------------------------------------------------------------
 # Application
 # --------------------------------------------------------------------------
@@ -125,21 +182,38 @@ class TexmanApp(App[None]):
         Binding("slash", "focus_filter", "Filter", key_display="/"),
         Binding("enter", "open_file", "Open in Neovim", show=True),
         Binding("d", "edit_description", "Describe"),
+        Binding("n", "new_document", "New"),
+        Binding("p", "edit_preamble", "Preamble"),
+        Binding("i", "toggle_ignore", "Ignore/Restore"),
         Binding("r", "rescan", "Rescan"),
         Binding("s", "stop_scan", "Stop scan"),
         Binding("q", "quit_app", "Quit"),
+        # `;` is consumed by `on_key` as a prefix before this binding could
+        # fire; the entry exists so the footer advertises the sequence.
+        Binding("semicolon", "next_directory", "Next dir", key_display=";s"),
         Binding("escape", "leave_filter", "Leave filter", show=False),
     ]
 
     def __init__(
         self,
         db_path: str | os.PathLike[str] | None = None,
-        scan_root: str = "/",
+        scan_roots: str | os.PathLike[str] | Sequence[str] | None = None,
         autoscan: bool = True,
+        preamble_path: str | os.PathLike[str] | None = None,
     ) -> None:
         super().__init__()
         self._db_path = db_path
-        self._scan_root = scan_root
+        self._preamble_path = str(
+            documents.default_preamble_path() if preamble_path is None else preamble_path
+        )
+        # Vim-style navigation state: typed count digits and a pending prefix.
+        self._count = ""
+        self._prefix = ""
+        self._scan_roots = tuple(
+            index.normalise_roots(
+                index.default_scan_roots() if scan_roots is None else scan_roots
+            )
+        )
         self._autoscan = autoscan
         self._conn = None
         self._entries: dict[str, index.CatalogEntry] = {}
@@ -149,7 +223,8 @@ class TexmanApp(App[None]):
         self._scan_running = False
         self._pending_refresh = False
         self._last_stats: index.ScanStats | None = None
-        self._directory_signature: tuple[tuple[str, int], ...] = ()
+        self._directory_signature: tuple[object, ...] = ()
+        self._ignored: list[str] = []
         # Messages can arrive before the widgets exist and while the app is
         # being torn down; handlers must do nothing in either case.
         self._widgets_ready = False
@@ -211,8 +286,9 @@ class TexmanApp(App[None]):
 
     def _reload_directories(self) -> None:
         option_list = self.query_one("#directories", OptionList)
+        self._ignored = index.list_ignored(self._conn)
         directories = index.list_directories(self._conn)
-        signature = tuple(directories)
+        signature = (tuple(directories), tuple(self._ignored))
         if signature == self._directory_signature and option_list.option_count:
             return  # Nothing new to show; rebuilding thousands of options is slow.
         self._directory_signature = signature
@@ -222,7 +298,23 @@ class TexmanApp(App[None]):
         option_list.add_option(Option(f"All directories ({total})", id=ALL_DIRECTORIES))
         for path, count in directories:
             option_list.add_option(Option(f"{path} ({count})", id=path))
-        known = {ALL_DIRECTORIES, *(path for path, _ in directories)}
+        if self._ignored:
+            # Ignored trees stay listed, because a hidden directory nobody can
+            # select again is a directory nobody can restore.
+            option_list.add_option(
+                Option(Text("── ignored ──", style="dim"), id=IGNORED_SEPARATOR,
+                       disabled=True)
+            )
+            for path in self._ignored:
+                hidden = len(
+                    index.list_files(self._conn, under=path, include_ignored=True)
+                )
+                option_list.add_option(
+                    Option(
+                        Text(f"{path} ({hidden} hidden)", style="dim"), id=path
+                    )
+                )
+        known = {ALL_DIRECTORIES, *(path for path, _ in directories), *self._ignored}
         if previous not in known:
             self._selected_dir = ALL_DIRECTORIES
         try:
@@ -232,8 +324,21 @@ class TexmanApp(App[None]):
 
     def _reload_files(self, keep_path: str | None = None) -> None:
         table = self.query_one("#files", DataTable)
-        parent = None if self._selected_dir == ALL_DIRECTORIES else self._selected_dir
-        entries = index.list_files(self._conn, parent_dir=parent, query=self._filter or None)
+        parent: str | None = None
+        under: str | None = None
+        if self._selected_dir in self._ignored:
+            under = self._selected_dir
+        elif self._selected_dir != ALL_DIRECTORIES:
+            parent = self._selected_dir
+        entries = index.list_files(
+            self._conn,
+            parent_dir=parent,
+            under=under,
+            query=self._filter or None,
+            # A directory chosen by name always shows its own files, ignored or
+            # not; the ignore filter is what the aggregate view applies.
+            include_ignored=parent is not None or under is not None,
+        )
 
         table.clear()
         self._entries = {entry.path: entry for entry in entries}
@@ -278,12 +383,19 @@ class TexmanApp(App[None]):
                 f"Nothing matches “{self._filter}”.\n"
                 "Edit the filter above, or empty it to see every file again."
             )
-        if index.count_files(self._conn) == 0:
+        if index.count_files(self._conn, include_ignored=True) == 0:
             return (
                 "No .tex or .sty files catalogued yet.\n"
                 "A scan is running — results appear as they are found. "
                 "Press r to rescan, s to stop."
             )
+        if index.count_files(self._conn) == 0:
+            return (
+                "Every catalogued directory is ignored.\n"
+                "Select one under “ignored” and press i to show it again."
+            )
+        if self._selected_dir in self._ignored:
+            return "This ignored directory has no catalogued files."
         return "This directory has no matching files."
 
     def _move_cursor_to(self, path: str) -> None:
@@ -369,6 +481,186 @@ class TexmanApp(App[None]):
         if event.input.id == "filter":
             self.query_one("#files", DataTable).focus()
 
+    # ---------------------------------------------------------- navigation
+
+    def on_key(self, event: events.Key) -> None:
+        """Vim-style motions with counts: `5j`, `3k`, `gg`, `G`, `;s`, `;a`.
+
+        Textual dispatches this subclass handler before the App's own binding
+        check, so a key consumed here never reaches the plain shortcuts: the
+        `s` of `;s` must not stop a scan. Nothing is consumed while a text
+        input or a dialog has focus.
+        """
+        if (
+            not self._widgets_ready
+            or self._text_input_focused()
+            or isinstance(self.screen, ModalScreen)
+        ):
+            self._count = self._prefix = ""
+            return
+        key = event.key
+        if self._prefix:
+            prefix, self._prefix = self._prefix, ""
+            if key == "escape":
+                self._count = ""
+                self._consume(event)
+                return
+            motion = SEQUENCES.get((prefix, event.character or key))
+            if motion is None:
+                self._count = ""
+                self.notify(
+                    f"{prefix}{event.character or key} is not a shortcut.",
+                    severity="warning",
+                    timeout=3,
+                )
+                self._consume(event)
+                return
+            self._run_motion(motion)
+            self._consume(event)
+            return
+        if key in PREFIXES:
+            self._prefix = PREFIXES[key]
+            self._consume(event)
+            return
+        character = event.character or ""
+        if character.isdigit() and (self._count or character != "0"):
+            if len(self._count) < COUNT_DIGITS:
+                self._count += character
+            self._consume(event)
+            return
+        motion = MOTIONS.get(key)
+        if motion is None:
+            # A count applies to motions only; any other key drops it and
+            # goes on to its usual binding.
+            self._count = ""
+            return
+        if key in ("down", "up") and not self._count:
+            return  # the widget's own binding handles a plain arrow key
+        self._run_motion(motion)
+        self._consume(event)
+
+    @staticmethod
+    def _consume(event: events.Key) -> None:
+        event.prevent_default()
+        event.stop()
+
+    def _run_motion(self, motion: str) -> None:
+        count = int(self._count) if self._count else None
+        self._count = ""
+        steps = count or 1
+        if motion == "down":
+            self._move_by(steps)
+        elif motion == "up":
+            self._move_by(-steps)
+        elif motion == "top":
+            self._move_to(count - 1 if count else 0)
+        elif motion == "bottom":
+            self._move_to(count - 1 if count else -1)
+        elif motion == "next_directory":
+            self._jump_directory(steps)
+        elif motion == "previous_directory":
+            self._jump_directory(-steps)
+        elif motion == "directories":
+            self.query_one("#directories", OptionList).focus()
+        elif motion == "files":
+            table = self.query_one("#files", DataTable)
+            if table.display:
+                table.focus()
+
+    def _directories_focused(self) -> bool:
+        focused = self.focused
+        return focused is not None and focused.id == "directories"
+
+    def _enabled_options(self) -> list[int]:
+        option_list = self.query_one("#directories", OptionList)
+        return [
+            position
+            for position, option in enumerate(option_list.options)
+            if not option.disabled
+        ]
+
+    def _move_to(self, index: int) -> None:
+        """Move the focused pane's cursor to a position; negative counts from the end."""
+        if self._directories_focused():
+            enabled = self._enabled_options()
+            if not enabled:
+                return
+            if index < 0:
+                index = max(0, len(enabled) + index)
+            option_list = self.query_one("#directories", OptionList)
+            option_list.highlighted = enabled[min(index, len(enabled) - 1)]
+            return
+        table = self.query_one("#files", DataTable)
+        if not table.display or table.row_count == 0:
+            return
+        if index < 0:
+            index = max(0, table.row_count + index)
+        table.move_cursor(row=min(index, table.row_count - 1))
+
+    def _move_by(self, delta: int) -> None:
+        if self._directories_focused():
+            enabled = self._enabled_options()
+            option_list = self.query_one("#directories", OptionList)
+            highlighted = option_list.highlighted
+            position = enabled.index(highlighted) if highlighted in enabled else 0
+        else:
+            position = self.query_one("#files", DataTable).cursor_row or 0
+        self._move_to(max(0, position + delta))
+
+    def _jump_directory(self, step: int) -> None:
+        """Move to the next (or previous) directory, `step` groups away.
+
+        In the grouped table that is the next heading's first file. When the
+        table shows a single directory, or the directory pane has focus, the
+        directory list itself is stepped, which reloads the table.
+        """
+        headings = [
+            position
+            for position, key in enumerate(self._row_order)
+            if key.startswith(HEADING_PREFIX)
+        ]
+        table = self.query_one("#files", DataTable)
+        if headings and table.display and not self._directories_focused():
+            row = table.cursor_row or 0
+            current = max(
+                (number for number, heading in enumerate(headings) if heading <= row),
+                default=-1,
+            )
+            target = current + step
+            if not 0 <= target < len(headings):
+                self.notify(
+                    "No next directory." if step > 0 else "No previous directory.",
+                    severity="information",
+                    timeout=2,
+                )
+                return
+            first_file = min(headings[target] + 1, len(self._row_order) - 1)
+            table.move_cursor(row=first_file)
+            return
+        enabled = self._enabled_options()
+        option_list = self.query_one("#directories", OptionList)
+        highlighted = option_list.highlighted
+        position = enabled.index(highlighted) if highlighted in enabled else 0
+        target = min(max(0, position + step), len(enabled) - 1) if enabled else 0
+        if not enabled or enabled[target] == highlighted:
+            self.notify(
+                "No next directory." if step > 0 else "No previous directory.",
+                severity="information",
+                timeout=2,
+            )
+            return
+        option_list.highlighted = enabled[target]
+
+    def action_next_directory(self) -> None:
+        if self._text_input_focused():
+            return
+        self._jump_directory(1)
+
+    def action_previous_directory(self) -> None:
+        if self._text_input_focused():
+            return
+        self._jump_directory(-1)
+
     # ------------------------------------------------------------- scanning
 
     def start_scan(self) -> None:
@@ -377,11 +669,14 @@ class TexmanApp(App[None]):
             self.notify("A scan is already running.", severity="warning")
             return
         self._scan_running = True
-        self._update_status(f"Scanning {self._scan_root} …")
-        self._scan_worker(self._scan_root)
+        self._update_status(f"Scanning {self._roots_label()} …")
+        self._scan_worker(self._scan_roots)
+
+    def _roots_label(self) -> str:
+        return ", ".join(index.display_path(root) for root in self._scan_roots) or "nothing"
 
     @work(thread=True, group="scan", exclusive=True)
-    def _scan_worker(self, root: str) -> None:
+    def _scan_worker(self, roots: tuple[str, ...]) -> None:
         worker = get_current_worker()
 
         def progress(stats: index.ScanStats) -> None:
@@ -397,10 +692,10 @@ class TexmanApp(App[None]):
         def batch(records, stats: index.ScanStats) -> None:
             self.post_message(ScanBatch(count=len(records)))
 
-        stats = index.ScanStats(root=root)
+        stats = index.ScanStats(roots=list(roots))
         try:
             stats = index.run_scan(
-                root,
+                roots,
                 db_path=self._db_path,
                 should_cancel=lambda: worker.is_cancelled,
                 on_progress=progress,
@@ -486,6 +781,69 @@ class TexmanApp(App[None]):
             filter_input.display = False
         self.query_one("#files", DataTable).focus()
 
+    def _directory_in_context(self) -> str | None:
+        """The directory `i` acts on: the highlighted one, or the selected file's.
+
+        Both panes are usable, because the file table is where the cursor
+        normally sits and its rows name a directory just as clearly.
+        """
+        focused = self.focused
+        if focused is not None and focused.id == "directories":
+            return None if self._selected_dir == ALL_DIRECTORIES else self._selected_dir
+        table = self.query_one("#files", DataTable)
+        row = table.cursor_row
+        if row is not None and 0 <= row < len(self._row_order):
+            key = self._row_order[row]
+            if key.startswith(HEADING_PREFIX):
+                return key[len(HEADING_PREFIX):]
+            entry = self._entries.get(key)
+            if entry is not None:
+                return entry.parent_dir
+        return None if self._selected_dir == ALL_DIRECTORIES else self._selected_dir
+
+    def action_toggle_ignore(self) -> None:
+        """Hide a directory and its subdirectories, or show it again.
+
+        Nothing is deleted: the rows and their descriptions wait, and the next
+        scan simply does not enter the directory.
+        """
+        if self._text_input_focused() or self._conn is None:
+            return
+        target = self._directory_in_context()
+        if target is None:
+            self.notify(
+                "Select a directory or a file first; i hides the directory it "
+                "belongs to.",
+                severity="information",
+            )
+            return
+        covering = index.covering_ignore(target, self._ignored)
+        if covering is None:
+            index.ignore_directory(self._conn, target)
+            self.notify(
+                f"Ignoring {target} and everything under it. Descriptions are "
+                "kept and scans will skip it; press i on its entry under "
+                "“ignored” to show it again.",
+                timeout=8,
+            )
+            if index.is_ignored(self._selected_dir, [target]):
+                self._selected_dir = ALL_DIRECTORIES
+        elif covering == target:
+            index.unignore_directory(self._conn, target)
+            self.notify(f"{target} is shown again.")
+        else:
+            self.notify(
+                f"{target} is hidden by {covering}. Press i on that entry to "
+                "show this one again.",
+                severity="warning",
+                timeout=8,
+            )
+            return
+        # The option list is rebuilt only when its contents change, and they
+        # just did.
+        self._directory_signature = ()
+        self.reload_catalog()
+
     def action_open_file(self) -> None:
         if self._text_input_focused():
             return
@@ -501,8 +859,11 @@ class TexmanApp(App[None]):
         self._open_in_neovim(entry)
 
     def _open_in_neovim(self, entry: index.CatalogEntry) -> None:
+        self._edit(entry.path, entry.parent_dir)
+
+    def _edit(self, path: str, cwd: str) -> None:
         """Hand the terminal to Neovim, then restore the same selection."""
-        keep = entry.path
+        keep = self.selected_path
         if shutil.which("nvim") is None:
             self.notify(NVIM_MISSING, severity="error", timeout=12)
             return
@@ -512,7 +873,7 @@ class TexmanApp(App[None]):
         failure: OSError | None = None
         with self.suspend():
             try:
-                subprocess.run(["nvim", entry.path], cwd=entry.parent_dir, check=False)
+                subprocess.run(["nvim", path], cwd=cwd, check=False)
             except OSError as exc:
                 failure = exc
         if failure is not None:
@@ -524,9 +885,82 @@ class TexmanApp(App[None]):
         # Editing a file changes no catalogued field, so the table stands as it
         # is and the same row stays selected.
         table = self.query_one("#files", DataTable)
-        self._move_cursor_to(keep)
-        table.focus()
+        if keep is not None:
+            self._move_cursor_to(keep)
+        if table.display:
+            table.focus()
         self._refresh_detail()
+
+    # ------------------------------------------------- preamble and new files
+
+    def action_edit_preamble(self) -> None:
+        """Open the preamble template in Neovim, creating it first if needed."""
+        if self._text_input_focused():
+            return
+        try:
+            created = documents.ensure_preamble(self._preamble_path)
+        except OSError as exc:
+            self.notify(
+                f"Could not create the preamble at {self._preamble_path}: {exc}",
+                severity="error",
+            )
+            return
+        if created:
+            self.notify(
+                f"Created {index.display_path(self._preamble_path)} with a starter "
+                "preamble. Edit it; every new document starts as a copy of it.",
+                timeout=8,
+            )
+        self._edit(self._preamble_path, os.path.dirname(self._preamble_path))
+
+    def _default_document_directory(self) -> str:
+        """Where a new document goes unless the user says otherwise."""
+        target = self._directory_in_context()
+        if target is None:
+            target = self._scan_roots[0] if self._scan_roots else os.path.expanduser("~")
+        return target
+
+    def action_new_document(self) -> None:
+        if self._text_input_focused() or self._conn is None:
+            return
+        if os.path.exists(self._preamble_path):
+            note = f"Template: {index.display_path(self._preamble_path)}"
+        else:
+            note = (
+                "No preamble.tex yet: the built-in default is used. "
+                "Press p afterwards to create and edit yours."
+            )
+        self.push_screen(
+            NewDocumentDialog(self._default_document_directory(), note),
+            self._create_document,
+        )
+
+    def _create_document(self, answer: tuple[str, str] | None) -> None:
+        if answer is None or self._conn is None:
+            return
+        name, directory = answer
+        try:
+            path, from_template = documents.create_document(
+                directory, name, self._preamble_path
+            )
+        except documents.DocumentError as exc:
+            self.notify(f"Not created: {exc}", severity="error", timeout=8)
+            return
+        parent = os.path.dirname(path)
+        index.upsert_files(
+            self._conn, [index.FileRecord(path=path, parent_dir=parent, extension=".tex")]
+        )
+        message = f"Created {index.display_path(path)}"
+        if not from_template:
+            message += " from the built-in preamble (press p to make your own)"
+        covering = index.covering_ignore(parent, self._ignored)
+        if covering is not None:
+            message += f". Its directory is hidden by {covering}, so it is not listed"
+        self.notify(message + ".", timeout=8)
+        # The directory list may have gained an entry.
+        self._directory_signature = ()
+        self.reload_catalog(keep_path=path)
+        self._edit(path, parent)
 
     def action_edit_description(self) -> None:
         if self._text_input_focused():

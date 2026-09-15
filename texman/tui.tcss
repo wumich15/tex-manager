@@ -57,3 +57,8 @@ DescriptionDialog {
 #dialog-hint {
     color: $text-muted;
 }
+
+#dialog-note {
+    color: $text-muted;
+    margin-top: 1;
+}

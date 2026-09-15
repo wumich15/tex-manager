@@ -43,6 +43,10 @@ class CommandTests(unittest.TestCase):
         self.assertIn("texman", result.stdout)
         self.assertIn("scan", result.stdout)
 
+    def test_preamble_option_is_offered(self) -> None:
+        result = run(["--help"])
+        self.assertIn("--preamble", result.stdout)
+
     def test_version_is_reported(self) -> None:
         result = run(["--version"])
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -75,6 +79,89 @@ class ScanCommandTests(unittest.TestCase):
         result = run(["--db", str(self.db), "scan", "--root", str(self.root), "--quiet"])
         self.assertIn("skipped", result.stdout)
         self.assertIn("Full Disk Access", result.stdout)
+
+
+class DefaultRootTests(unittest.TestCase):
+    """`texman` scans ~/Documents and ~/Downloads unless told otherwise."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name).resolve()
+        self.db = self.home / "index.sqlite3"
+        self.addCleanup(self.tmp.cleanup)
+
+    def _make(self, *names: str) -> None:
+        for name in names:
+            (self.home / name).mkdir()
+            (self.home / name / f"{name.lower()}.tex").write_text("x")
+
+    def test_scan_without_root_uses_documents_and_downloads(self) -> None:
+        self._make("Documents", "Downloads")
+        (self.home / "Elsewhere").mkdir()
+        (self.home / "Elsewhere" / "ignored.tex").write_text("x")
+        result = run(
+            ["--db", str(self.db), "scan", "--quiet"], env={"HOME": str(self.home)}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("~/Documents, ~/Downloads", result.stdout)
+        conn = index.connect(self.db)
+        self.addCleanup(conn.close)
+        paths = {entry.path for entry in index.list_files(conn)}
+        self.assertEqual(
+            paths,
+            {
+                str(self.home / "Documents" / "documents.tex"),
+                str(self.home / "Downloads" / "downloads.tex"),
+            },
+        )
+
+    def test_several_roots_can_be_given(self) -> None:
+        self._make("Documents", "Downloads", "Elsewhere")
+        result = run(
+            [
+                "--db", str(self.db), "scan",
+                "--root", str(self.home / "Documents"),
+                "--root", str(self.home / "Elsewhere"),
+                "--quiet",
+            ],
+            env={"HOME": str(self.home)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        conn = index.connect(self.db)
+        self.addCleanup(conn.close)
+        paths = {entry.path for entry in index.list_files(conn)}
+        self.assertEqual(
+            paths,
+            {
+                str(self.home / "Documents" / "documents.tex"),
+                str(self.home / "Elsewhere" / "elsewhere.tex"),
+            },
+        )
+
+    def test_root_given_before_the_subcommand_is_not_discarded(self) -> None:
+        self._make("Documents", "Elsewhere")
+        result = run(
+            [
+                "--db", str(self.db),
+                "--root", str(self.home / "Elsewhere"),
+                "scan", "--quiet",
+            ],
+            env={"HOME": str(self.home)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        conn = index.connect(self.db)
+        self.addCleanup(conn.close)
+        paths = {entry.path for entry in index.list_files(conn)}
+        self.assertEqual(paths, {str(self.home / "Elsewhere" / "elsewhere.tex")})
+
+    def test_absent_default_roots_are_explained(self) -> None:
+        result = run(
+            ["--db", str(self.db), "scan", "--quiet"], env={"HOME": str(self.home)}
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("~/Documents", result.stderr)
+        self.assertIn("--root", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
 
 class ScanRootValidationTests(unittest.TestCase):
@@ -144,6 +231,15 @@ class AiCommandTests(unittest.TestCase):
         code = ai.main(stdin=Tty(), stdout=io.StringIO(), stderr=err)
         self.assertNotEqual(code, 0)
         self.assertIn("standard input", err.getvalue())
+
+    def test_keymap_requests_need_no_buffer(self) -> None:
+        payload = json.dumps({"mode": "keymap", "prompt": "an enumerate shortcut"})
+        env = {"TEXMAN_OPENAI_MODEL": "some-model", "OPENAI_API_KEY": ""}
+        result = run(["ai"], stdin=payload, env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        # Validation passed; the request failed only for lack of a key.
+        self.assertIn("OPENAI_API_KEY", result.stderr)
 
     def test_ai_does_not_touch_the_catalog(self) -> None:
         db = Path(tempfile.mkdtemp()) / "never-created.sqlite3"

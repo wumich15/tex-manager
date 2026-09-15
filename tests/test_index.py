@@ -158,6 +158,99 @@ class WalkTests(unittest.TestCase):
         self.assertIn("/dev", index._excluded_for("/"))
 
 
+class RootTests(unittest.TestCase):
+    """The default roots, and walking more than one of them."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name).resolve()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _as_home(self):
+        return unittest.mock.patch.dict(os.environ, {"HOME": str(self.home)})
+
+    def test_default_roots_are_documents_and_downloads(self) -> None:
+        (self.home / "Documents").mkdir()
+        (self.home / "Downloads").mkdir()
+        with self._as_home():
+            self.assertEqual(
+                index.default_scan_roots(),
+                [str(self.home / "Documents"), str(self.home / "Downloads")],
+            )
+
+    def test_a_missing_default_root_is_dropped_not_fatal(self) -> None:
+        (self.home / "Downloads").mkdir()
+        with self._as_home():
+            self.assertEqual(
+                index.default_scan_roots(), [str(self.home / "Downloads")]
+            )
+
+    def test_default_roots_are_empty_when_neither_exists(self) -> None:
+        with self._as_home():
+            self.assertEqual(index.default_scan_roots(), [])
+
+    def test_display_path_abbreviates_the_home_directory(self) -> None:
+        with self._as_home():
+            self.assertEqual(
+                index.display_path(str(self.home / "Documents")), "~/Documents"
+            )
+            self.assertEqual(index.display_path("/usr/local"), "/usr/local")
+
+    def test_roots_are_absolute_and_deduplicated_in_order(self) -> None:
+        self.assertEqual(
+            index.normalise_roots([self.home, self.home / "a" / "..", self.home]),
+            [str(self.home)],
+        )
+
+    def test_walking_two_roots_finds_files_under_both(self) -> None:
+        first, second = self.home / "Documents", self.home / "Downloads"
+        first.mkdir()
+        second.mkdir()
+        (first / "one.tex").write_text("x")
+        (second / "two.sty").write_text("x")
+        stats = index.ScanStats()
+        found = {r.path for r in index.walk_tree([first, second], stats)}
+        self.assertEqual(found, {str(first / "one.tex"), str(second / "two.sty")})
+        self.assertEqual(stats.roots, [str(first), str(second)])
+
+    def test_a_file_reachable_from_two_roots_is_yielded_once(self) -> None:
+        first, second = self.home / "Documents", self.home / "Downloads"
+        first.mkdir()
+        second.mkdir()
+        (first / "shared.tex").write_text("x")
+        os.symlink(first, second / "link-to-documents")
+        stats = index.ScanStats()
+        found = [r.path for r in index.walk_tree([first, second], stats)]
+        self.assertEqual(found, [str(first / "shared.tex")])
+        self.assertEqual(stats.files_found, 1)
+
+    def test_summary_names_every_root(self) -> None:
+        stats = index.ScanStats(roots=["/a", "/b"], finished=True)
+        self.assertIn("Scan of /a, /b complete", stats.summary())
+
+    def test_run_scan_defaults_to_the_default_roots(self) -> None:
+        (self.home / "Documents").mkdir()
+        (self.home / "Downloads").mkdir()
+        (self.home / "Documents" / "paper.tex").write_text("x")
+        (self.home / "Downloads" / "grabbed.sty").write_text("x")
+        (self.home / "Elsewhere").mkdir()
+        (self.home / "Elsewhere" / "ignored.tex").write_text("x")
+        with self._as_home():
+            stats = index.run_scan(db_path=self.home / "index.sqlite3")
+        self.assertTrue(stats.complete)
+        self.assertEqual(stats.files_found, 2)
+        conn = index.connect(self.home / "index.sqlite3")
+        self.addCleanup(conn.close)
+        paths = {entry.path for entry in index.list_files(conn)}
+        self.assertEqual(
+            paths,
+            {
+                str(self.home / "Documents" / "paper.tex"),
+                str(self.home / "Downloads" / "grabbed.sty"),
+            },
+        )
+
+
 class CatalogTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -357,6 +450,123 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(
                 index.default_db_path(), self.root / "xdg" / "texman" / "index.sqlite3"
             )
+
+
+class IgnoreTests(unittest.TestCase):
+    """Ignoring hides a directory tree; it never deletes anything."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.files = build_fixture(self.root)
+        self.db = self.root / "index.sqlite3"
+        self.addCleanup(self.tmp.cleanup)
+        index.run_scan(self.root, db_path=self.db)
+        self.conn = index.connect(self.db)
+        self.addCleanup(self.conn.close)
+        self.papers = str(self.root / "papers")
+        self.thesis = str(self.root / "papers" / "thesis")
+
+    def visible(self) -> set[str]:
+        return {entry.path for entry in index.list_files(self.conn)}
+
+    def test_ignoring_hides_the_directory_and_everything_under_it(self) -> None:
+        before = self.visible()
+        self.assertTrue(index.ignore_directory(self.conn, self.papers))
+        hidden = before - self.visible()
+        self.assertEqual(
+            hidden,
+            {
+                str(self.files[key].resolve())
+                for key in ("main", "chapter", "other_main", "spaces", "upper")
+            },
+        )
+        self.assertNotIn(
+            self.papers, [path for path, _ in index.list_directories(self.conn)]
+        )
+        self.assertNotIn(
+            self.thesis, [path for path, _ in index.list_directories(self.conn)]
+        )
+
+    def test_rows_and_descriptions_survive_being_ignored(self) -> None:
+        target = str(self.files["main"].resolve())
+        index.set_description(self.conn, target, "keep me")
+        index.ignore_directory(self.conn, self.papers)
+        self.assertNotIn(target, self.visible())
+        entry = index.get_file(self.conn, target)
+        assert entry is not None
+        self.assertEqual(entry.description, "keep me")
+        index.unignore_directory(self.conn, self.papers)
+        self.assertIn(target, self.visible())
+        restored = index.get_file(self.conn, target)
+        assert restored is not None
+        self.assertEqual(restored.description, "keep me")
+
+    def test_counts_follow_the_ignore_rules(self) -> None:
+        total = index.count_files(self.conn)
+        index.ignore_directory(self.conn, self.papers)
+        self.assertEqual(index.count_files(self.conn), total - 5)
+        self.assertEqual(index.count_files(self.conn, include_ignored=True), total)
+
+    def test_include_ignored_shows_everything_again(self) -> None:
+        index.ignore_directory(self.conn, self.papers)
+        paths = {
+            entry.path
+            for entry in index.list_files(self.conn, include_ignored=True)
+        }
+        self.assertIn(str(self.files["main"].resolve()), paths)
+
+    def test_under_returns_a_whole_tree(self) -> None:
+        paths = {
+            entry.path
+            for entry in index.list_files(
+                self.conn, under=self.papers, include_ignored=True
+            )
+        }
+        self.assertIn(str(self.files["main"].resolve()), paths)   # in a subdirectory
+        self.assertIn(str(self.files["upper"].resolve()), paths)  # directly inside
+        self.assertNotIn(str(self.files["sty"].resolve()), paths)
+
+    def test_a_sibling_with_a_shared_prefix_is_not_hidden(self) -> None:
+        self.assertIsNone(index.covering_ignore("/a/bc", ["/a/b"]))
+        self.assertEqual(index.covering_ignore("/a/b/c", ["/a/b"]), "/a/b")
+        self.assertEqual(index.covering_ignore("/a/b", ["/a/b"]), "/a/b")
+
+    def test_ignoring_something_already_hidden_changes_nothing(self) -> None:
+        self.assertTrue(index.ignore_directory(self.conn, self.papers))
+        self.assertFalse(index.ignore_directory(self.conn, self.thesis))
+        self.assertEqual(index.list_ignored(self.conn), [self.papers])
+
+    def test_unignoring_a_directory_hidden_by_its_parent_reports_false(self) -> None:
+        index.ignore_directory(self.conn, self.papers)
+        self.assertFalse(index.unignore_directory(self.conn, self.thesis))
+        self.assertEqual(index.list_ignored(self.conn), [self.papers])
+
+    def test_the_walk_does_not_enter_an_ignored_tree(self) -> None:
+        stats = index.ScanStats()
+        found = {
+            record.path
+            for record in index.walk_tree(self.root, stats, ignored=[self.papers])
+        }
+        self.assertNotIn(str(self.files["main"].resolve()), found)
+        self.assertIn(str(self.files["sty"].resolve()), found)
+        self.assertEqual(stats.ignored, 1)
+        self.assertIn("ignored directory", stats.summary())
+
+    def test_a_scan_reads_the_ignore_list_from_the_catalog(self) -> None:
+        index.ignore_directory(self.conn, self.papers)
+        (self.root / "papers" / "new.tex").write_text("x")
+        stats = index.run_scan(self.root, db_path=self.db)
+        self.assertTrue(stats.complete)
+        self.assertGreaterEqual(stats.ignored, 1)
+        self.assertIsNone(
+            index.get_file(self.conn, str(self.root / "papers" / "new.tex"))
+        )
+
+    def test_an_explicit_ignore_list_overrides_the_catalog(self) -> None:
+        index.ignore_directory(self.conn, self.papers)
+        stats = index.run_scan(self.root, db_path=self.db, ignored=[])
+        self.assertEqual(stats.ignored, 0)
 
 
 if __name__ == "__main__":  # pragma: no cover
