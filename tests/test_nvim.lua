@@ -6,8 +6,9 @@
 -- makes no API calls. It covers insertion before the first and a middle line,
 -- appending, invalid lines, unsaved context, one-step undo, switched buffers,
 -- changed and closed buffers, helper failure, log-driven fixes, and drafting
--- key mappings into the mappings file, whole-file context, and the cached
--- preamble summary.
+-- key mappings into the mappings file, whole-file context, the cached
+-- preamble summary, the in-buffer progress indicator, prompt recall, and
+-- messages that wait while the user is typing a command.
 
 local script_dir = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':p:h')
 local module_path = script_dir .. '/../nvim/texman.lua'
@@ -95,6 +96,9 @@ handle:close()
 vim.fn.setfperm(fake, 'rwxr-xr-x')
 vim.env.PATH = tmp .. ':' .. vim.env.PATH
 vim.env.TEXMAN_FAKE_MODE = 'ok'
+-- Messages are cut to the screen width, and several here carry long temporary
+-- paths; a wide screen keeps them whole. Truncation itself is checked below.
+vim.o.columns = 240
 
 -- ------------------------------------------------------------------- harness
 
@@ -166,6 +170,12 @@ local function write_log(path, body)
 end
 
 local texman = dofile(module_path)
+local namespace = vim.api.nvim_create_namespace('texman')
+
+--- The texman extmarks in `buf`, with details, for the indicator checks.
+local function marks(buf)
+  return vim.api.nvim_buf_get_extmarks(buf, namespace, 0, -1, { details = true })
+end
 local keymaps_file = tmp .. '/texman-keymaps.lua'
 local keymap_snippet = "vim.keymap.set('n', '<leader>zz', function() vim.notify('texman greeting') end, { desc = 'texman test mapping' })"
 local sample = { '\\documentclass{article}', '\\begin{document}', 'Hello.', '\\end{document}' }
@@ -350,15 +360,193 @@ do
 end
 
 do
+  -- Typing above the target while waiting must not lose the result: the
+  -- insertion point follows the line it was given.
   vim.env.TEXMAN_FAKE_MODE = 'slow'
   local buf = new_tex_buffer(sample)
-  run('1 add an equation')
-  vim.api.nvim_buf_set_lines(buf, 0, 0, true, { 'Typed while waiting.' })
-  ok('changed buffer is reported', wait_for('changed since the request'), last_note())
-  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, true)
-  eq('stale result was discarded', lines[1], 'Typed while waiting.')
-  ok('no snippet was inserted', lines[2] == sample[1], vim.inspect(lines))
+  run('2 add an equation')
+  vim.api.nvim_buf_set_lines(buf, 0, 0, true, { 'Typed while waiting.', 'And more.' })
+  ok('typing above the target still inserts', wait_for('inserted 1 line%(s%) before line 4'),
+    last_note())
+  eq('the snippet landed before the original line',
+    vim.api.nvim_buf_get_lines(buf, 0, -1, true),
+    { 'Typed while waiting.', 'And more.', sample[1], '\\alpha', sample[2], sample[3], sample[4] })
   vim.env.TEXMAN_FAKE_MODE = 'ok'
+end
+
+do
+  -- Typing below the target leaves the insertion point where it was.
+  vim.env.TEXMAN_FAKE_MODE = 'slow'
+  local buf = new_tex_buffer(sample)
+  run('2 add an equation')
+  vim.api.nvim_buf_set_lines(buf, 3, 3, true, { 'Typed below.' })
+  ok('typing below the target still inserts', wait_for('inserted 1 line%(s%) before line 2'),
+    last_note())
+  eq('the snippet landed before line 2',
+    vim.api.nvim_buf_get_lines(buf, 0, -1, true),
+    { sample[1], '\\alpha', sample[2], sample[3], 'Typed below.', sample[4] })
+  vim.env.TEXMAN_FAKE_MODE = 'ok'
+end
+
+do
+  -- Deleting the target line moves the insertion point to its neighbour rather
+  -- than dropping the result.
+  vim.env.TEXMAN_FAKE_MODE = 'slow'
+  local buf = new_tex_buffer(sample)
+  run('3 add an equation')
+  vim.api.nvim_buf_set_lines(buf, 2, 3, true, {})
+  ok('deleting the target line still inserts', wait_for('inserted 1 line'), last_note())
+  eq('the snippet landed where the line was',
+    vim.api.nvim_buf_get_lines(buf, 0, -1, true), { sample[1], sample[2], '\\alpha', sample[4] })
+  vim.env.TEXMAN_FAKE_MODE = 'ok'
+end
+
+do
+  -- Appending tracks the last line: text added at the end while waiting comes
+  -- after the mark, and the snippet goes right below the line that was last.
+  vim.env.TEXMAN_FAKE_MODE = 'slow'
+  local buf = new_tex_buffer(sample)
+  run('5 append an equation')
+  vim.api.nvim_buf_set_lines(buf, 4, 4, true, { 'Typed at the end.' })
+  ok('appending while typing still inserts', wait_for('inserted 1 line%(s%) before line 5'),
+    last_note())
+  eq('the snippet followed the line that was last',
+    vim.api.nvim_buf_get_lines(buf, 0, -1, true),
+    { sample[1], sample[2], sample[3], sample[4], '\\alpha', 'Typed at the end.' })
+  vim.env.TEXMAN_FAKE_MODE = 'ok'
+end
+
+-- ---------------------------------------------------------------- indicator
+
+do
+  vim.env.TEXMAN_FAKE_MODE = 'slow'
+  local buf = new_tex_buffer(sample)
+  run('3 add an equation about lines')
+  local found = marks(buf)
+  eq('one indicator mark while the request runs', #found, 1)
+  local details = found[1] and found[1][4] or {}
+  eq('the indicator sits on the target line', found[1] and found[1][2], 2)
+  ok('the indicator is a virtual line above the insertion point',
+    details.virt_lines ~= nil and details.virt_lines_above == true, vim.inspect(details))
+  local text = ''
+  for _, chunk in ipairs(details.virt_lines and details.virt_lines[1] or {}) do
+    text = text .. chunk[1]
+  end
+  ok('the indicator names the work', string.find(text, 'generating LaTeX', 1, true) ~= nil, text)
+  ok('the indicator shows the prompt', string.find(text, 'add an equation about lines', 1, true) ~= nil,
+    text)
+  ok('the indicator counts seconds', string.match(text, '%d+s') ~= nil, text)
+  -- The extmark carries no text, so the buffer is not modified by it.
+  eq('the indicator changes no text', vim.api.nvim_buf_get_lines(buf, 0, -1, true), sample)
+  ok('the request completes', wait_for('inserted 1 line'), last_note())
+  local after = marks(buf)
+  eq('the spinner is gone once the text arrived',
+    vim.tbl_count(vim.tbl_filter(function(m) return m[4].virt_lines ~= nil end, after)), 0)
+  eq('the inserted line is highlighted for a moment',
+    vim.tbl_count(vim.tbl_filter(function(m) return m[4].hl_group == 'DiffAdd' end, after)), 1)
+  ok('the highlight fades', vim.wait(3000, function() return #marks(buf) == 0 end, 50))
+  vim.env.TEXMAN_FAKE_MODE = 'ok'
+end
+
+do
+  vim.env.TEXMAN_FAKE_MODE = 'slow'
+  local buf = new_tex_buffer(sample)
+  run('5 append an equation')
+  local found = marks(buf)
+  ok('appending draws the indicator below the last line',
+    #found == 1 and found[1][2] == 3 and found[1][4].virt_lines_above ~= true, vim.inspect(found))
+  ok('the append request completes', wait_for('inserted 1 line'), last_note())
+  vim.env.TEXMAN_FAKE_MODE = 'ok'
+end
+
+do
+  vim.env.TEXMAN_FAKE_MODE = 'fail'
+  local buf = new_tex_buffer(sample)
+  run('2 add an equation')
+  eq('an indicator is shown for a request that will fail', #marks(buf), 1)
+  ok('the failure is reported', wait_for('OPENAI_API_KEY'), last_note())
+  eq('the indicator is removed after a failure', #marks(buf), 0)
+  vim.env.TEXMAN_FAKE_MODE = 'ok'
+end
+
+do
+  local buf = new_tex_buffer(sample)
+  run('9 out of range')
+  vim.wait(100)
+  eq('a refused request leaves no indicator', #marks(buf), 0)
+end
+
+-- ------------------------------------------------------------ prompt recall
+
+do
+  local buf = new_tex_buffer(sample)
+  run('3 add an equation')
+  ok('recall waits for the request', wait_for('inserted 3 line'), last_note())
+  -- setup() was last called with `TexAIAlt`, so that is the name recalled.
+  local cmd = texman.command_name
+  eq('the last command can be recalled', texman.recall_command(buf), cmd .. ' 3 add an equation')
+  run('9 too far, but worth keeping')
+  vim.wait(100)
+  eq('a refused request is still recalled', texman.recall_command(buf),
+    cmd .. ' 9 too far, but worth keeping')
+  run('1 whole file please', true)
+  ok('a bang request completes', wait_for('inserted 3 line'), last_note())
+  eq('an explicit bang is recalled', texman.recall_command(buf), cmd .. '! 1 whole file please')
+  local other = new_tex_buffer(sample)
+  eq('a buffer without a request falls back to the last one anywhere',
+    texman.recall_command(other), cmd .. '! 1 whole file please')
+  eq('the buffer with its own request keeps it', texman.recall_command(buf),
+    cmd .. '! 1 whole file please')
+
+  local fed
+  local real_feedkeys = vim.api.nvim_feedkeys
+  vim.api.nvim_feedkeys = function(keys, mode, escape)
+    fed = { keys = keys, mode = mode, escape = escape }
+  end
+  ok('recall reports success', texman.recall() == true)
+  vim.api.nvim_feedkeys = real_feedkeys
+  eq('recall types the command without executing it',
+    fed, { keys = ':' .. cmd .. '! 1 whole file please', mode = 'n', escape = false })
+  ok(':TexAIPrompt exists', vim.api.nvim_get_commands({})['TexAIPrompt'] ~= nil)
+end
+
+-- ------------------------------------------------- messages while typing
+
+do
+  -- A message that arrives while the user is on the command line is held
+  -- back, because echoing it there makes Neovim repeat the half-typed command.
+  local real_mode = vim.api.nvim_get_mode
+  vim.api.nvim_get_mode = function()
+    return { mode = 'c', blocking = false }
+  end
+  notes = {}
+  texman.request('0 too small')
+  vim.wait(250)
+  eq('no message while a command is being typed', #notes, 0)
+  vim.api.nvim_get_mode = function()
+    return { mode = 'n', blocking = true }
+  end
+  vim.wait(250)
+  eq('no message during a blocking prompt either', #notes, 0)
+  vim.api.nvim_get_mode = real_mode
+  ok('the message arrives once the command line is left', wait_for('out of range'), last_note())
+  eq('it arrives exactly once', #notes, 1)
+end
+
+do
+  -- Messages never wrap into a hit-enter prompt: they are cut to the screen.
+  local saved = vim.o.columns
+  vim.o.columns = 40
+  notes = {}
+  texman.request('')
+  ok('a long message is truncated', vim.fn.strdisplaywidth(last_note()) <= 39, last_note())
+  ok('the truncation is marked', string.sub(last_note(), -3) == '…', last_note())
+  ok('the start of the message survives', string.match(last_note(), '^texman: usage') ~= nil,
+    last_note())
+  vim.o.columns = saved
+  notes = {}
+  texman.request('')
+  ok('a message that fits is left whole', string.match(last_note(), '<prompt>$') ~= nil, last_note())
 end
 
 do
@@ -516,6 +704,41 @@ do
   ok('extra guidance reaches the prompt',
     string.find(payload.prompt, 'Additional guidance', 1, true) ~= nil
       and string.find(payload.prompt, 'textbf over', 1, true) ~= nil, payload.prompt)
+end
+
+do
+  -- Typing elsewhere while a fix runs is fine: the blamed line is tracked.
+  vim.env.TEXMAN_FAKE_MODE = 'slow'
+  local buf, path = open_saved_file('fix-typing.tex', blamed)
+  write_log(path, error_log('fix-typing.tex', 3, 'Undefined control sequence.'))
+  notes = {}
+  texman.fix('')
+  local found = marks(buf)
+  ok('a fix shows its indicator at the end of the blamed line',
+    #found == 1 and found[1][2] == 2 and found[1][4].virt_text_pos == 'eol', vim.inspect(found))
+  vim.api.nvim_buf_set_lines(buf, 0, 0, true, { '% typed while fixing' })
+  ok('a fix survives typing elsewhere', wait_for('replaced line 4'), last_note())
+  eq('the tracked line was replaced', vim.api.nvim_buf_get_lines(buf, 0, -1, true), {
+    '% typed while fixing', blamed[1], blamed[2], '\\alpha', blamed[4],
+  })
+  eq('the fix indicator is gone', vim.tbl_count(vim.tbl_filter(function(m)
+    return m[4].virt_text ~= nil end, marks(buf))), 0)
+  vim.env.TEXMAN_FAKE_MODE = 'ok'
+end
+
+do
+  -- But the blamed line itself must still read as the compiler saw it.
+  vim.env.TEXMAN_FAKE_MODE = 'slow'
+  local buf, path = open_saved_file('fix-edited.tex', blamed)
+  write_log(path, error_log('fix-edited.tex', 3, 'Undefined control sequence.'))
+  notes = {}
+  texman.fix('')
+  vim.api.nvim_buf_set_lines(buf, 2, 3, true, { 'Blamed line, edited by hand.' })
+  ok('an edited blamed line is refused', wait_for('line 3 changed since the request'), last_note())
+  eq('nothing was replaced', vim.api.nvim_buf_get_lines(buf, 0, -1, true), {
+    blamed[1], blamed[2], 'Blamed line, edited by hand.', blamed[4],
+  })
+  vim.env.TEXMAN_FAKE_MODE = 'ok'
 end
 
 do

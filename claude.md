@@ -51,6 +51,15 @@ anything non-trivial; it explains the design decisions and the invariants below.
    summary, so later requests match its packages and macros without re-reading
    or re-sending the file; the first `:TexAI` after an edit does the same by
    itself. All added at the user's request.
+10. While a request runs, an extmark marks the insertion point in the buffer
+   with a spinner, the elapsed seconds, and the prompt; it follows the line
+   through the user's edits, so typing while waiting no longer discards the
+   result. Inserted lines flash briefly. `:TexAIPrompt` puts the last `:TexAI`
+   command back on the command line to edit and resend. Messages are held
+   while the user is typing a `:` command or sitting at a prompt, and cut to
+   one screen line, because an asynchronous message echoed at those moments
+   made Neovim repeat the half-typed command on new lines at every keystroke.
+   All added at the user's request.
 
 "One place" means a catalog of the original files. Do not move or copy them:
 relative `\input`, `\include`, images, and style references must keep working.
@@ -67,7 +76,7 @@ texman/
   preamble.py             # the cached summary of that template
   tui.py, tui.tcss        # directory/file browser, description editor, dialogs
   ai.py                   # request validation and OpenAI generation (4 modes)
-nvim/texman.lua           # :TexAI, :TexAIFix, :TexAIMap, :TexPreamble
+nvim/texman.lua           # :TexAI, :TexAIFix, :TexAIMap, :TexAIPrompt, :TexPreamble
 tests/
   test_index.py           # walk + catalog, against a temporary fixture
   test_documents.py       # template and document creation, in a temp dir
@@ -230,11 +239,33 @@ tests still pass.
   matching: a short echo would match the wrong line.
 - **Neovim owns insertion.** `:TexAI` inserts *before* line `L`; valid values are
   `1` through `N + 1`, where `N + 1` appends. The request captures the buffer
-  handle, its `changedtick`, and its in-memory lines; the scheduled callback
-  re-checks that the buffer is loaded, modifiable, and unchanged before a single
-  `nvim_buf_set_lines` call, so the insertion is one undo step and never lands on
-  a stale line. One active request per buffer, with the flag cleared on every
-  exit path. Nothing is saved automatically.
+  handle and its in-memory lines, and places an extmark on line `L` (on line
+  `N` when appending) that follows the line through the user's edits; the
+  scheduled callback re-checks that the buffer is loaded and modifiable, reads
+  the mark's current row, and makes a single `nvim_buf_set_lines` call there,
+  so the insertion is one undo step and lands before the line the user named
+  even if they typed above it meanwhile. A `changedtick` check would discard
+  the result whenever the user kept typing, which is the bug it replaced. One
+  active request per buffer, with the flag cleared on every exit path. Nothing
+  is saved automatically.
+- **The indicator is decoration, never text.** The spinner line, the fix
+  marker, and the completion flash are extmarks in the `texman` namespace
+  (`virt_lines`, eol `virt_text`, and a timed `hl_group` range). They change no
+  buffer text and no `changedtick`, they are removed on every exit path of the
+  request, including refusals and launch failures, and a request refused
+  before it started leaves none behind. `:TexAIFix` still compares the tracked
+  line's text with the text the compiler saw, and refuses if it differs.
+- **Messages never interrupt typing.** `notify` cuts every message to one
+  screen line, so it can never wrap into a hit-enter prompt that swallows the
+  next key, and it queues messages while `nvim_get_mode()` reports command-line
+  mode, a prompt (`r*`), or `blocking`, delivering them once the mode is safe.
+  Echoing during command-line editing is what made Neovim repeat the half-typed
+  command on new lines. The queue is the only place a message waits; nothing is
+  dropped.
+- **`:TexAIPrompt` recalls, it never resends.** The last request per buffer is
+  recorded before any refusal, so a rejected prompt can be recalled too; the
+  command is fed to the command line with `nvim_feedkeys` and no `<CR>`, so
+  the user edits it and decides. Only an explicit `!` is repeated.
 - The only network operation is the explicitly requested AI generation. The
   catalog and saved descriptions stay local.
 
@@ -242,7 +273,7 @@ tests still pass.
 
 ```sh
 python -m unittest discover -s tests -t .       # 269 checks
-nvim --headless -u NONE -l tests/test_nvim.lua  # 169 checks
+nvim --headless -u NONE -l tests/test_nvim.lua  # 214 checks
 ```
 
 `python` here means the project's `.venv/bin/python`; the system `python3` on
@@ -300,6 +331,10 @@ from one error; it does not iterate, recompile, or repair a whole document.
 `:TexAIMap` drafts one mapping per request into one file; it does not edit
 `init.lua`, manage plugins, or run code the user has not saved. The Vim
 motions are the ones listed; there is no general keymap layer or rebinding.
+The progress indicator is one extmark per request and a short flash; there is
+no notification framework, floating window, or statusline component, and
+`:TexAIPrompt` recalls one command rather than keeping a browsable history
+(Neovim's own command history already does that).
 The preamble digest summarises one shared template into one cache file: no
 per-document digests, no summarising a document's own inline preamble, no
 chained or server-stored conversation state, and no second cache of anything

@@ -18,7 +18,7 @@ texman/documents.py  the preamble.tex template and documents made from it
 texman/preamble.py   the cached summary of that template (no network of its own)
 texman/tui.py        Textual browser, description editor, scan worker
 texman/ai.py         JSON-in/text-out OpenAI helper (the only network code)
-nvim/texman.lua      :TexAI, :TexAIFix, :TexAIMap, :TexPreamble; owns all
+nvim/texman.lua      :TexAI, :TexAIFix, :TexAIMap, :TexAIPrompt, :TexPreamble; owns all
                      buffer modification
 ```
 
@@ -380,20 +380,57 @@ which shape was used, so the two are never confused after the fact.
 One request per buffer at a time, tracked in a table keyed by buffer handle and
 cleared on every exit path, including failures.
 
-The request captures the buffer handle, its `changedtick`, and its *in-memory*
-lines, so unsaved edits are part of the context. `vim.system({'texman','ai'}, …)`
-runs asynchronously with the JSON on stdin and the environment inherited; there
-is no shell command string, so neither the key nor the prompt is ever exposed to
+The request captures the buffer handle and its *in-memory* lines, so unsaved
+edits are part of the context. `vim.system({'texman','ai'}, …)` runs
+asynchronously with the JSON on stdin and the environment inherited; there is
+no shell command string, so neither the key nor the prompt is ever exposed to
 shell quoting.
 
-The completion callback is scheduled onto the main loop and re-validates before
-touching anything: the buffer must still be loaded, still modifiable, and have
-the same `changedtick`. Otherwise the result is discarded with an explanation to
-rerun — a stale line number is never used. Switching windows in the meantime is
-fine, because insertion targets the captured handle rather than the current
-buffer.
+The insertion point is an extmark, placed by `track` on line `L` (or on the
+last line when appending), in the `texman` namespace. Extmarks move with the
+text, so the user can keep typing while the request runs: lines added or
+removed above the target shift the mark, and the result still lands before the
+line the user named. The first version compared `changedtick` instead and
+discarded the result whenever the buffer had changed, which in practice meant
+every request the user did not sit still for. Only a buffer that is closed or
+no longer modifiable discards a result now; the `guarded` wrapper checks those
+two before `apply` reads the mark's current row and makes its one
+`nvim_buf_set_lines` call. Switching windows in the meantime is fine, because
+insertion targets the captured handle rather than the current buffer.
 
-`:TexAIFix` reuses all of that plumbing and adds the log work. It locates the log
+The same extmark is the progress indicator. `track` decorates it with a
+virtual line above the insertion point (below the last line when appending)
+carrying a spinner frame, the seconds elapsed, and the prompt, redrawn by a
+`vim.uv` timer every 120 ms through `vim.schedule_wrap`; `:TexAIFix` uses
+end-of-line virtual text on the blamed line instead. A tracker's `stop`
+closes the timer and deletes the mark, and `run` calls it on every exit path —
+success, failure, empty output, launch error, and a busy refusal — so a
+spinner can never outlive its request. After a successful edit, `flash`
+highlights the new lines with a second extmark for 1.5 s. None of this touches
+buffer text or `changedtick`; the indicator is decoration only.
+
+Messages go through `notify`, which does two things `vim.notify` alone does
+not. It cuts the text to one screen line, because a wrapped message ends in a
+"Press ENTER" prompt that swallows the user's next keystroke. And it looks at
+`nvim_get_mode()` first: while the user is in command-line mode, at a prompt
+(`r`, `rm`, `r?`), or `blocking`, the message is queued and a 100 ms timer
+delivers it once the mode is safe. An asynchronous echo during command-line
+editing is what made Neovim repeat the half-typed command on a new line at
+every following keystroke, the bug the user described as the command
+"repeating itself a ton". The queue delivers everything, in order, exactly
+once.
+
+Every `:TexAI` request is recorded per buffer before validation, so a prompt
+refused for a bad line number is recorded too. `:TexAIPrompt` (`M.recall`)
+feeds `:TexAI[!] <line> <prompt>` to the command line with `nvim_feedkeys` and
+no carriage return, so the user edits and resends deliberately; it falls back
+to the last request made anywhere when the current buffer has none, and repeats
+`!` only when it was typed, since a bang from `TEXMAN_FULL_FILE` still applies.
+
+`:TexAIFix` reuses all of that plumbing and adds the log work. Its tracker sits
+on the blamed line, and `apply` refuses when the text at the mark no longer
+matches what the compiler saw, so typing elsewhere is fine but an edited blamed
+line is never replaced blind. It locates the log
 from vimtex's own `b:vimtex.root` and `b:vimtex.compiler.file_info.jobname`
 (honouring `out_dir`) when vimtex is loaded, and otherwise tries `<stem>.log`,
 `build/<stem>.log`, and `out/<stem>.log` beside the file.
@@ -469,11 +506,15 @@ paths instead of a pattern, which avoids pattern-escaping the config path.
   paths that need no API key. Every check in `test_ai.py` runs with XDG pointed
   at a temporary directory, because a generation request now looks up a cached
   summary and would otherwise touch the developer's own cache.
-- `nvim --headless -u NONE -l tests/test_nvim.lua` — 169 checks against a fake
+- `nvim --headless -u NONE -l tests/test_nvim.lua` — 214 checks against a fake
   `texman` executable on `PATH`, covering insertion before the first and a
   middle line, appending, invalid lines and prompts, unsaved context,
-  backslashes in prompts, one-step undo, switched buffers, changed and closed
-  buffers, duplicate requests, helper failure, empty output, a missing helper,
+  backslashes in prompts, one-step undo, switched buffers, typing above, below,
+  at, and after the target while a request runs, closed buffers, duplicate
+  requests, helper failure, empty output, a missing helper, the indicator's
+  placement, content, and removal on success, failure, and refusal, the
+  completion flash, prompt recall with and without a bang, messages held during
+  command-line and blocking modes and truncated to the screen width,
   every log shape `:TexAIFix` understands and every refusal, and for
   `:TexAIMap` the draft-review-write flow, one-step undo, refusal of Lua that
   does not compile, and a broken mappings file at startup. It also covers the

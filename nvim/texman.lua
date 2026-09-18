@@ -4,6 +4,7 @@
 --   :TexAI! <line> <prompt>  the same, with the whole file as context
 --   :TexAIFix [guidance]     replace the line the compiler blamed
 --   :TexAIMap <prompt>       draft a key mapping into texman's mappings file
+--   :TexAIPrompt             put the last :TexAI command back on the command line
 --   :TexPreamble             summarise the preamble template, once, and cache it
 --
 -- All Ex commands start with an uppercase letter as Neovim requires, and `/`
@@ -15,6 +16,7 @@ local M = {}
 local DEFAULT_COMMAND = 'TexAI'
 local DEFAULT_FIX_COMMAND = 'TexAIFix'
 local DEFAULT_MAP_COMMAND = 'TexAIMap'
+local DEFAULT_PROMPT_COMMAND = 'TexAIPrompt'
 local DEFAULT_PREAMBLE_COMMAND = 'TexPreamble'
 -- Mappings drafted by :TexAIMap live in their own file, loaded by `setup()`
 -- inside pcall, so a bad mapping can never break Neovim's startup. init.lua
@@ -49,8 +51,88 @@ local BUSY_MESSAGE = {
   [PREAMBLE_KEY] = 'the preamble is already being summarised',
 }
 
+local uv = vim.uv or vim.loop
+
+-- Extmarks in this namespace track where a result will land and show the
+-- in-buffer progress indicator; nothing else is ever stored there.
+local NAMESPACE = vim.api.nvim_create_namespace('texman')
+local SPINNER = { '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏' }
+local SPINNER_MS = 120
+-- Inserted or replaced lines are highlighted this long, so a result that
+-- arrives while the user is looking elsewhere is still noticed.
+local FLASH_MS = 1500
+local MAX_PROMPT_SHOWN = 60
+
+-- Messages wait while the user is typing on the command line or answering a
+-- prompt. A message echoed at that moment scrolls the screen, and Neovim then
+-- repeats the half-typed command on a new line at every keystroke; a message
+-- during a hit-enter prompt swallows the next key. Deferred messages are
+-- delivered from this queue as soon as the mode is safe again.
+local pending_messages = {}
+local flush_timer = nil
+local FLUSH_MS = 100
+
+local function unsafe_mode()
+  local mode = vim.api.nvim_get_mode()
+  local first = string.sub(mode.mode, 1, 1)
+  return mode.blocking or first == 'c' or first == 'r'
+end
+
+--- Reduce `text` to one line that fits the command line.
+---
+--- A message wider than the screen wraps and ends in a "Press ENTER" prompt,
+--- which interrupts whatever the user was typing; a truncated line does not.
+local function fit(text)
+  text = string.gsub(text, '%s*\n.*$', '')
+  local width = math.max(20, vim.o.columns - 1)
+  if vim.fn.strdisplaywidth(text) <= width then
+    return text
+  end
+  local kept = vim.fn.strcharpart(text, 0, width - 1)
+  while vim.fn.strchars(kept) > 0 and vim.fn.strdisplaywidth(kept .. '…') > width do
+    kept = vim.fn.strcharpart(kept, 0, vim.fn.strchars(kept) - 1)
+  end
+  return kept .. '…'
+end
+
+local function flush_messages()
+  if unsafe_mode() then
+    return false
+  end
+  local queued = pending_messages
+  pending_messages = {}
+  for _, entry in ipairs(queued) do
+    vim.notify(entry.message, entry.level)
+  end
+  return true
+end
+
 local function notify(message, level)
-  vim.notify('texman: ' .. message, level or vim.log.levels.INFO)
+  message = fit('texman: ' .. message)
+  level = level or vim.log.levels.INFO
+  if not unsafe_mode() then
+    vim.notify(message, level)
+    return
+  end
+  table.insert(pending_messages, { message = message, level = level })
+  if not flush_timer then
+    flush_timer = uv.new_timer()
+    flush_timer:start(FLUSH_MS, FLUSH_MS, vim.schedule_wrap(function()
+      if flush_timer and flush_messages() then
+        flush_timer:stop()
+        flush_timer:close()
+        flush_timer = nil
+      end
+    end))
+  end
+end
+
+--- Shorten a prompt for display beside the spinner.
+local function shown(prompt)
+  if vim.fn.strchars(prompt) <= MAX_PROMPT_SHOWN then
+    return prompt
+  end
+  return vim.fn.strcharpart(prompt, 0, MAX_PROMPT_SHOWN - 1) .. '…'
 end
 
 local function first_line(text)
@@ -115,14 +197,20 @@ end
 --- `on_output` receives stdout and returns a message describing what changed,
 --- plus an optional log level. `empty` is the message for a command that
 --- printed nothing.
-local function run(key, argv, stdin, on_output, progress, empty)
+local function run(key, argv, stdin, on_output, progress, empty, cleanup)
   if active[key] then
     notify(BUSY_MESSAGE[key] or 'a request is already running for this buffer', vim.log.levels.WARN)
-    return
+    if cleanup then
+      pcall(cleanup)
+    end
+    return false
   end
 
   local function finish(message, level)
     active[key] = nil
+    if cleanup then
+      pcall(cleanup)
+    end
     if message then
       notify(message, level)
     end
@@ -161,27 +249,27 @@ local function run(key, argv, stdin, on_output, progress, empty)
     timeout = REQUEST_TIMEOUT_MS,
   }, on_exit)
   if not ok then
-    active[key] = nil
-    notify(
+    finish(
       'could not run `' .. table.concat(argv, ' ') .. '`: ' .. tostring(launch_error),
       vim.log.levels.ERROR
     )
-    return
+    return false
   end
   notify(progress)
+  return true
 end
 
 --- Send one JSON request to `texman ai`, which is how every generation works.
-local function send(key, payload, on_output, progress, empty)
-  return run(key, { 'texman', 'ai' }, vim.json.encode(payload), on_output, progress, empty)
+local function send(key, payload, on_output, progress, empty, cleanup)
+  return run(key, { 'texman', 'ai' }, vim.json.encode(payload), on_output, progress, empty, cleanup)
 end
 
---- Wrap `apply(buf, output)` so it runs only if `buf` is still as it was.
+--- Wrap `apply(buf, output)` so it runs only if `buf` can still take the edit.
 ---
---- The changedtick is captured now, when the request is built, and re-checked
---- when the output arrives, so a result never lands on a stale line.
+--- Where the edit lands is the tracker's business (see `track`), so the user
+--- may keep typing while a request runs; only a closed or read-only buffer
+--- discards the result.
 local function guarded(buf, apply)
-  local tick = vim.api.nvim_buf_get_changedtick(buf)
   return function(output)
     if not vim.api.nvim_buf_is_loaded(buf) then
       return 'the buffer was closed; rerun the command', vim.log.levels.WARN
@@ -189,11 +277,105 @@ local function guarded(buf, apply)
     if not vim.bo[buf].modifiable then
       return 'the buffer is no longer modifiable; rerun the command', vim.log.levels.WARN
     end
-    if vim.api.nvim_buf_get_changedtick(buf) ~= tick then
-      return 'the buffer changed since the request; rerun the command', vim.log.levels.WARN
-    end
     return apply(buf, output)
   end
+end
+
+--- Mark where a result will land, and show a spinner there until it arrives.
+---
+--- The extmark does two jobs. It follows the target line through the user's
+--- own edits, so typing elsewhere while a request runs moves the insertion
+--- point instead of invalidating the result. And it carries the indicator: a
+--- virtual line above the insertion point (below the last line when
+--- appending), or text after the line being repaired, with a spinner, the
+--- seconds elapsed, and what was asked. `opts.label` names the work,
+--- `opts.detail` is the prompt or message, `opts.below` puts the line under the
+--- marked row, and `opts.eol` draws at the end of the line instead.
+---
+--- `row()` gives the current 0-based row, or nil if the mark is gone.
+--- `stop()` removes the indicator; it is safe to call more than once.
+local function track(buf, row, opts)
+  local mark = vim.api.nvim_buf_set_extmark(buf, NAMESPACE, row, 0, {})
+  local started = uv.now()
+  local frame = 0
+  local timer = uv.new_timer()
+  local tracker = {}
+
+  local function position()
+    if not vim.api.nvim_buf_is_loaded(buf) then
+      return nil
+    end
+    local found = vim.api.nvim_buf_get_extmark_by_id(buf, NAMESPACE, mark, {})
+    if #found == 0 then
+      return nil
+    end
+    return found
+  end
+
+  local function decorate()
+    local at = position()
+    if not at then
+      return false
+    end
+    frame = frame % #SPINNER + 1
+    local elapsed = math.floor((uv.now() - started) / 1000)
+    local head = string.format('%s texman: %s … %ds', SPINNER[frame], opts.label, elapsed)
+    local chunks = { { ' ' .. head, 'DiagnosticInfo' }, { '  ' .. (opts.detail or ''), 'Comment' } }
+    local extmark = { id = mark }
+    if opts.eol then
+      extmark.virt_text = chunks
+      extmark.virt_text_pos = 'eol'
+    else
+      chunks[1][1] = ' ' .. chunks[1][1]
+      extmark.virt_lines = { chunks }
+      extmark.virt_lines_above = not opts.below
+    end
+    return pcall(vim.api.nvim_buf_set_extmark, buf, NAMESPACE, at[1], at[2], extmark)
+  end
+
+  function tracker.row()
+    local at = position()
+    return at and at[1] or nil
+  end
+
+  function tracker.stop()
+    if timer then
+      timer:stop()
+      timer:close()
+      timer = nil
+    end
+    pcall(vim.api.nvim_buf_del_extmark, buf, NAMESPACE, mark)
+  end
+
+  decorate()
+  timer:start(SPINNER_MS, SPINNER_MS, vim.schedule_wrap(function()
+    if timer and not decorate() then
+      tracker.stop()
+    end
+  end))
+  return tracker
+end
+
+--- Highlight `count` lines from 0-based `row` for a moment, then let go.
+local function flash(buf, row, count)
+  if count < 1 then
+    return
+  end
+  local ok, mark = pcall(vim.api.nvim_buf_set_extmark, buf, NAMESPACE, row, 0, {
+    end_row = row + count,
+    end_col = 0,
+    hl_group = 'DiffAdd',
+    hl_eol = true,
+    strict = false,
+  })
+  if not ok then
+    return
+  end
+  local timer = uv.new_timer()
+  timer:start(FLASH_MS, 0, vim.schedule_wrap(function()
+    timer:close()
+    pcall(vim.api.nvim_buf_del_extmark, buf, NAMESPACE, mark)
+  end))
 end
 
 -- -------------------------------------------------------- :TexAI (insert)
@@ -210,12 +392,21 @@ local function parse_args(args)
   return tonumber(number), prompt, nil
 end
 
+-- The last `:TexAI` request per buffer, and the last one anywhere, so the
+-- prompt can be brought back after a failure or a refusal (see `M.recall`).
+local last = {}
+
 --- Insert generated LaTeX before line `L`; valid values are 1 through N + 1.
 ---
 --- With `bang` (`:TexAI!`) the whole buffer goes out as context, numbered, so
 --- the prompt may refer to any part of it -- "look at the previous 30 lines".
 --- Without it only the lines around `L` do. `TEXMAN_FULL_FILE=1` makes the
 --- bang the default for someone who always wants it.
+---
+--- While the request runs, a spinner line marks the insertion point in the
+--- buffer and follows it through the user's edits; typing elsewhere in the
+--- meantime is fine. The result is inserted before the line that was line `L`
+--- when the command ran, wherever it is by then.
 function M.request(args, bang)
   local line, prompt, err = parse_args(args)
   if err then
@@ -224,6 +415,10 @@ function M.request(args, bang)
   end
 
   local buf = vim.api.nvim_get_current_buf()
+  -- Recorded before any refusal, so a rejected prompt can be recalled too.
+  last[buf] = { line = line, prompt = prompt, bang = bang == true }
+  M.last_request = last[buf]
+
   local problem = buffer_problem(buf)
   if problem then
     notify(problem, vim.log.levels.ERROR)
@@ -248,12 +443,30 @@ function M.request(args, bang)
     buffer_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, true),
   }
 
+  -- Appending marks the last line and inserts after it; everything else marks
+  -- line L and inserts before it. Either way the mark moves with the text.
+  local append = line == count + 1
+  local tracker = track(buf, append and count - 1 or line - 1, {
+    label = full and string.format('generating LaTeX from the whole file (%d lines)', count)
+      or 'generating LaTeX',
+    detail = shown(prompt),
+    below = append,
+  })
+
   local function apply(target, output)
+    local row = tracker.row()
+    if row == nil then
+      return 'the insertion point was lost; rerun the command', vim.log.levels.WARN
+    end
+    if append then
+      row = row + 1
+    end
     local lines = output_lines(output)
     break_undo(target)
     -- One call, so `u` undoes the whole insertion in one step.
-    vim.api.nvim_buf_set_lines(target, line - 1, line - 1, true, lines)
-    return string.format('inserted %d line(s) before line %d; press u to undo', #lines, line)
+    vim.api.nvim_buf_set_lines(target, row, row, true, lines)
+    flash(target, row, #lines)
+    return string.format('inserted %d line(s) before line %d; press u to undo', #lines, row + 1)
   end
 
   send(
@@ -264,8 +477,44 @@ function M.request(args, bang)
       'generating LaTeX for line %d (%s) …',
       line,
       full and string.format('whole file, %d lines', count) or 'nearby lines'
-    )
+    ),
+    nil,
+    tracker.stop
   )
+end
+
+--- The `:TexAI` command line that would repeat the last request, or nil.
+---
+--- The request for `buf` (default: the current buffer) is preferred, then the
+--- last one made anywhere. Only an explicit `!` is repeated; a bang that came
+--- from `TEXMAN_FULL_FILE` still applies without being spelled out.
+function M.recall_command(buf)
+  local entry = last[buf or vim.api.nvim_get_current_buf()] or M.last_request
+  if not entry then
+    return nil
+  end
+  return string.format(
+    '%s%s %d %s',
+    M.command_name or DEFAULT_COMMAND,
+    entry.bang and '!' or '',
+    entry.line,
+    entry.prompt
+  )
+end
+
+--- Put the last `:TexAI` command back on the command line, unexecuted.
+---
+--- The prompt is there to edit, and Enter sends it again -- after a failure,
+--- a refusal, or an `u` that removed a first attempt. Returns false when
+--- nothing has been asked yet.
+function M.recall()
+  local command = M.recall_command()
+  if not command then
+    notify('nothing to recall: no :' .. (M.command_name or DEFAULT_COMMAND) .. ' request has been made yet', vim.log.levels.WARN)
+    return false
+  end
+  vim.api.nvim_feedkeys(':' .. command, 'n', false)
+  return true
 end
 
 -- ------------------------------------------------------- :TexAIFix (repair)
@@ -511,18 +760,33 @@ function M.fix(args)
   }
 
   local original = vim.api.nvim_buf_get_lines(buf, entry.line - 1, entry.line, true)[1]
+  local tracker = track(buf, entry.line - 1, {
+    label = 'fixing this line',
+    detail = shown(entry.message),
+    eol = true,
+  })
 
   local function apply(target_buf, output)
+    local row = tracker.row()
+    -- The mark follows the blamed line through edits elsewhere, but the line
+    -- itself must still read as it did when the compiler saw it.
+    if row == nil or vim.api.nvim_buf_get_lines(target_buf, row, row + 1, true)[1] ~= original then
+      return string.format(
+        'line %d changed since the request; save, recompile, and rerun the command',
+        entry.line
+      ), vim.log.levels.WARN
+    end
     local replacement = output_lines(output)
     if #replacement == 1 and replacement[1] == original then
-      return string.format('line %d already looks correct; nothing changed', entry.line)
+      return string.format('line %d already looks correct; nothing changed', row + 1)
     end
     break_undo(target_buf)
     -- One call, so `u` undoes the whole replacement in one step.
-    vim.api.nvim_buf_set_lines(target_buf, entry.line - 1, entry.line, true, replacement)
+    vim.api.nvim_buf_set_lines(target_buf, row, row + 1, true, replacement)
+    flash(target_buf, row, #replacement)
     return string.format(
       'replaced line %d with %d line(s); press u to undo, :w to keep',
-      entry.line,
+      row + 1,
       #replacement
     )
   end
@@ -532,7 +796,9 @@ function M.fix(args)
     buf,
     payload,
     guarded(buf, apply),
-    string.format('fixing line %d: %s%s', entry.line, entry.message, assumed)
+    string.format('fixing line %d: %s%s', entry.line, entry.message, assumed),
+    nil,
+    tracker.stop
   )
 end
 
@@ -713,15 +979,16 @@ end
 --- Register the Ex commands and load the mappings file.
 ---
 --- Pass `{ command = 'OtherName' }`, `{ fix_command = 'OtherName' }`,
---- `{ map_command = 'OtherName' }`, or `{ preamble_command = 'OtherName' }` if
---- a name is already taken, and `{ keymaps_file = '/path/to/file.lua' }` to
---- keep drafted mappings elsewhere than
---- `stdpath('config')/texman-keymaps.lua`.
+--- `{ map_command = 'OtherName' }`, `{ prompt_command = 'OtherName' }`, or
+--- `{ preamble_command = 'OtherName' }` if a name is already taken, and
+--- `{ keymaps_file = '/path/to/file.lua' }` to keep drafted mappings elsewhere
+--- than `stdpath('config')/texman-keymaps.lua`.
 function M.setup(opts)
   opts = opts or {}
   local name = opts.command or DEFAULT_COMMAND
   local fix_name = opts.fix_command or DEFAULT_FIX_COMMAND
   local map_name = opts.map_command or DEFAULT_MAP_COMMAND
+  local prompt_name = opts.prompt_command or DEFAULT_PROMPT_COMMAND
   local preamble_name = opts.preamble_command or DEFAULT_PREAMBLE_COMMAND
 
   local ok = register(name, function(cmd)
@@ -756,6 +1023,16 @@ function M.setup(opts)
     desc = 'Draft a key mapping from a description into the texman mappings file',
   }) then
     M.map_command_name = map_name
+  end
+
+  -- Optional too: the command history still holds every prompt without it.
+  if register(prompt_name, function()
+    M.recall()
+  end, {
+    nargs = 0,
+    desc = 'Put the last :TexAI command back on the command line to edit and resend',
+  }) then
+    M.prompt_command_name = prompt_name
   end
 
   -- Also optional: `:TexAI` seeds the summary by itself, so losing the command

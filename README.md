@@ -33,6 +33,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for how it works internally.
   generated LaTeX before line 25 of the buffer you are editing.
 - `:TexAI! 765 Look at the previous 30 lines and make a diagram for this` sends
   the whole file, with line numbers, so the prompt can point at any part of it.
+- While a request runs, a spinner line in the buffer marks where the LaTeX will
+  go and shows what you asked; you can keep typing, and the result still lands
+  before the line you named. `:TexAIPrompt` puts your last `:TexAI` command
+  back on the command line to edit and resend.
 - `:TexPreamble` summarises your `preamble.tex` once, so everything `:TexAI`
   writes matches the packages and macros you actually load.
 - `:TexAIFix` reads your compiler's log, finds the line LaTeX complained about,
@@ -247,8 +251,9 @@ File management needs neither of these variables; `:TexAI` needs both.
    require('texman').setup({ command = 'TexGen' })
    ```
 
-   `fix_command`, `map_command`, and `preamble_command` rename `:TexAIFix`,
-   `:TexAIMap`, and `:TexPreamble` the same way. `setup` also loads
+   `fix_command`, `map_command`, `prompt_command`, and `preamble_command`
+   rename `:TexAIFix`, `:TexAIMap`, `:TexAIPrompt`, and `:TexPreamble` the
+   same way. `setup` also loads
    `~/.config/nvim/texman-keymaps.lua`, the file `:TexAIMap` writes to;
    `keymaps_file = '/some/other/path.lua'` moves it.
 
@@ -264,13 +269,35 @@ The fragment is inserted **before** line 10. Valid line numbers are `1` through
 `N + 1` for an `N`-line buffer, where `N + 1` appends to the end.
 
 - Your unsaved edits are part of the context sent with the prompt.
+- While the request runs, a virtual line appears above line 10 with a spinner,
+  the seconds elapsed, and your prompt. It is only a marker: it changes nothing
+  in the file, and it disappears when the answer arrives.
+- Keep typing if you like. The marker follows the line it was given, so if you
+  add or delete lines above it while waiting, the LaTeX still lands before the
+  line that was line 10 when you asked. Only closing the buffer or making it
+  read-only discards the result.
+- The inserted lines are highlighted for a moment, so you see them arrive.
 - The insertion is one undo step: press `u` to remove it.
 - Nothing is written to disk until you `:write` yourself.
-- If you change or close the buffer while the request is in flight, the result
-  is discarded rather than inserted at a stale line, and you are asked to rerun.
 - One request per buffer at a time. Errors (bad key, unavailable model, rate
   limit, timeout, no connection) are reported in a single short message; run the
   command again to retry.
+- Messages wait while you are typing a `:` command, and are cut to one screen
+  line, so a request finishing mid-keystroke never scrambles the command line
+  or leaves you at a "Press ENTER" prompt.
+
+### Getting a prompt back
+
+```vim
+:TexAIPrompt
+```
+
+puts your last `:TexAI` command, line number and prompt included, back on the
+command line without running it. Edit it and press Enter to send it again --
+after a failed request, a refused line number, or an `u` that removed a first
+attempt you want to rephrase. The prompt is remembered per buffer, and the
+spinner line shows it while the request is running. Neovim's own command
+history (`:` then the Up arrow, or `q:`) has every prompt too.
 
 ### How much of the file is sent
 
@@ -419,7 +446,7 @@ of keys already mapped (left-hand sides only) so the draft avoids them.
 
 ```sh
 python -m unittest discover -s tests -t .       # 269 checks
-nvim --headless -u NONE -l tests/test_nvim.lua  # 169 checks
+nvim --headless -u NONE -l tests/test_nvim.lua  # 214 checks
 ```
 
 Automated tests only scan a temporary fixture, never your whole machine, and the
