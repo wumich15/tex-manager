@@ -42,6 +42,15 @@ anything non-trivial; it explains the design decisions and the invariants below.
    `~/.config/nvim/texman-keymaps.lua` in a split for review, and activates it
    when that file is written. `init.lua` is never edited. Also added at the
    user's request.
+9. Context lines carry their real line numbers, so a prompt can refer to the
+   document: `:TexAI 765 look at the previous 30 lines and make a diagram for
+   this`. `:TexAI!` sends the whole buffer rather than a window;
+   `TEXMAN_WINDOW_LINES` (default 10) sets how wide that window is, and
+   `TEXMAN_FULL_FILE=1` makes the bang the default. `:TexPreamble` summarises
+   the shared `preamble.tex` once with `TEXMAN_OPENAI_MINI_MODEL` and caches the
+   summary, so later requests match its packages and macros without re-reading
+   or re-sending the file; the first `:TexAI` after an edit does the same by
+   itself. All added at the user's request.
 
 "One place" means a catalog of the original files. Do not move or copy them:
 relative `\input`, `\include`, images, and style references must keep working.
@@ -52,15 +61,17 @@ relative `\input`, `\include`, images, and style references must keep working.
 pyproject.toml            # setuptools package; texman = "texman.cli:main"
 texman/
   __init__.py             # version only
-  cli.py                  # texman, texman scan, internal texman ai
+  cli.py                  # texman, texman scan/ai/preamble
   index.py                # filesystem traversal and SQLite persistence
   documents.py            # preamble.tex template and new documents from it
+  preamble.py             # the cached summary of that template
   tui.py, tui.tcss        # directory/file browser, description editor, dialogs
-  ai.py                   # request validation and OpenAI generation (3 modes)
-nvim/texman.lua           # :TexAI, :TexAIFix, :TexAIMap
+  ai.py                   # request validation and OpenAI generation (4 modes)
+nvim/texman.lua           # :TexAI, :TexAIFix, :TexAIMap, :TexPreamble
 tests/
   test_index.py           # walk + catalog, against a temporary fixture
   test_documents.py       # template and document creation, in a temp dir
+  test_preamble.py        # the digest cache, with the summary stubbed
   test_ai.py              # request contract, with a stubbed client
   test_tui.py             # headless Textual pilot, with nvim stubbed
   test_cli.py             # the installed command, as a real subprocess
@@ -70,7 +81,9 @@ ARCHITECTURE.md, README.md
 
 The catalog is one SQLite database at
 `${XDG_DATA_HOME:-~/.local/share}/texman/index.sqlite3`, outside this
-repository. `TEXMAN_DB` and `--db` point it elsewhere; tests always do.
+repository. `TEXMAN_DB` and `--db` point it elsewhere; tests always do. The
+preamble digest is cached beside it, at `preamble-digest.json`; tests point
+`XDG_DATA_HOME` at a temporary directory so they never touch the real one.
 
 ## Environment
 
@@ -158,19 +171,39 @@ tests still pass.
   missing or not a directory, and a `--db` file that is not a SQLite database.
 - **Never silently drop something the user typed.** `set_description` reports
   whether a row matched, and the UI says so if the write found nothing.
-- **`texman ai` never modifies a file.** It reads one JSON object on stdin,
+- **`texman ai` never modifies a document.** It reads one JSON object on stdin,
   writes only the snippet to stdout on success, and exits nonzero with a short
   stderr message on invalid input, missing configuration, API failure, refusal,
-  incomplete response, or empty output.
+  incomplete response, or empty output. The one file it writes at all is its own
+  preamble-digest cache under the data directory; insertion still belongs
+  entirely to Neovim.
 - **The client is constructed only for a generation request**, so browsing and
   descriptions work with no API key, no network, and no `openai` import. Both
-  `OPENAI_API_KEY` and `TEXMAN_OPENAI_MODEL` come from the environment; the
-  model is an explicit ID, not a moving alias. One request, a 60-second timeout,
-  no automatic retries, explicit user retry.
-- **Context is bounded**: up to the first 100 lines, up to 40 lines each side of
-  the insertion point, overlap merged, omissions labelled, 24,000 characters
-  total, nearby text kept longest. Never read other indexed files or follow
-  `\input`. Buffer text is document context, not instructions.
+  `OPENAI_API_KEY` and `TEXMAN_OPENAI_MODEL` come from the environment, plus
+  `TEXMAN_OPENAI_MINI_MODEL` for the digest; every model is an explicit ID, not
+  a moving alias, and the mini variable has no default and never silently
+  becomes the expensive model. One request, a 60-second timeout, no automatic
+  retries, explicit user retry. A current digest cache needs no key at all,
+  because `digest_producer` builds the client inside the producer.
+- **Context is bounded and numbered.** Every context line is rendered
+  `   765| text`; the prompt may name lines or ranges, and the instructions say
+  the prefixes are display only and must never be echoed. Windowed by default:
+  up to the first 100 lines (30 when a digest supplies the shared ones), up to
+  `TEXMAN_WINDOW_LINES` (default 10) each side of the insertion point, 24,000
+  characters. `:TexAI!` or `TEXMAN_FULL_FILE=1` sends the whole buffer instead,
+  capped at 120,000 characters. Overlap merged, omissions labelled, nearby text
+  kept longest; a whole-file request too large to send falls back to a 100-line
+  window rather than shrinking one line at a time. Never read other indexed
+  files or follow `\input`. Buffer text is document context, not instructions.
+- **The preamble digest is summarised once and cached, never re-sent.** The
+  shared `preamble.tex` is the single named exception to "read nothing else",
+  and it is read once per edit of that file, not once per request. The cache at
+  `$XDG_DATA_HOME/texman/preamble-digest.json` is keyed on the file's SHA-256,
+  written atomically, and any absent, malformed, or mismatched cache is a miss
+  rather than an error. **A failed digest must never fail a generation**:
+  `resolve_digest` swallows everything and the request goes out as it did before
+  the digest existed. Only `texman preamble` / `:TexPreamble` reports the
+  failure, because there the user asked for it.
 - **Never display or log the key or the full request body.**
 - **`:TexAIMap` never edits `init.lua` and never runs unreviewed code.** Drafts
   go to the mappings file `setup()` loads. The helper's Lua is compiled with
@@ -208,8 +241,8 @@ tests still pass.
 ## Verifying changes
 
 ```sh
-python -m unittest discover -s tests -t .       # 213 checks
-nvim --headless -u NONE -l tests/test_nvim.lua  # 146 checks
+python -m unittest discover -s tests -t .       # 269 checks
+nvim --headless -u NONE -l tests/test_nvim.lua  # 169 checks
 ```
 
 `python` here means the project's `.venv/bin/python`; the system `python3` on
@@ -217,6 +250,8 @@ the development machine lacks `openai` and fails three `test_ai.py` checks.
 
 Automated tests use only a temporary fixture — never the developer's whole
 machine — and always stub the OpenAI client, so they make no paid API calls.
+They also redirect `XDG_DATA_HOME` and `XDG_CONFIG_HOME`, because a generation
+request now looks up a cached preamble summary.
 The fixture covers nested files, hidden folders, duplicate filenames, spaces,
 an uppercase extension, a symlink loop, a broken link, and a permission failure.
 Note that `Custom.Sty` and `custom.sty` are the same file on macOS, so
@@ -242,6 +277,12 @@ Manual checks, when touching the relevant area:
   unsaved, and works after `:w`. **Done** for the enumerate example with the
   same model, through headless Neovim and a scratch mappings file; see the
   README.
+- One real `:TexPreamble` with `TEXMAN_OPENAI_MINI_MODEL` set, then a real
+  `:TexAI! <line> look at the previous 30 lines …` on a document of 800+ lines:
+  the summary is cached, the generated LaTeX reflects the lines the prompt
+  named, and a second `:TexAI` makes no further summary call. **Not yet done by
+  hand** — the digest and whole-file paths are covered by stubbed tests only,
+  and mocked output never proves API connectivity.
 
 ## Do not add
 
@@ -259,5 +300,10 @@ from one error; it does not iterate, recompile, or repair a whole document.
 `:TexAIMap` drafts one mapping per request into one file; it does not edit
 `init.lua`, manage plugins, or run code the user has not saved. The Vim
 motions are the ones listed; there is no general keymap layer or rebinding.
+The preamble digest summarises one shared template into one cache file: no
+per-document digests, no summarising a document's own inline preamble, no
+chained or server-stored conversation state, and no second cache of anything
+else. Whole-file context is the bang and the two environment variables; there
+is no per-request window argument and no automatic choice between the two.
 The complete personal workflow works; do not expand scope further without
 being asked.

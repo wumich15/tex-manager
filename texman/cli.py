@@ -82,6 +82,19 @@ def build_parser() -> argparse.ArgumentParser:
         "ai",
         help="internal: read one JSON request on stdin, write the generated text to stdout",
     )
+
+    digest = sub.add_parser(
+        "preamble",
+        help="summarise the preamble template so :TexAI can match its packages and macros",
+    )
+    digest.add_argument(
+        "--force",
+        action="store_true",
+        help="summarise again even if the cached summary is still current",
+    )
+    digest.add_argument(
+        "--show", action="store_true", help="print the summary itself, not just a note"
+    )
     return parser
 
 
@@ -199,11 +212,43 @@ def _run_ai(args: argparse.Namespace) -> int:
     return ai.main()
 
 
+def _run_preamble(args: argparse.Namespace) -> int:
+    """Refresh the cached preamble summary, and say what happened.
+
+    Unlike the digest that `texman ai` makes on its own, a failure here is
+    reported: the user asked for this one, so they should hear why it did not
+    work rather than watch it silently do nothing.
+    """
+    from . import ai, documents, index, preamble
+
+    path = args.preamble or documents.default_preamble_path()
+    try:
+        record, generated = preamble.ensure_digest(
+            path, ai.digest_producer(), force=args.force
+        )
+    except (ai.AiError, preamble.DigestError) as exc:
+        print(f"texman preamble: {exc}", file=sys.stderr)
+        return 1
+
+    what = "summarised" if generated else "already current"
+    print(
+        f"{index.display_path(record.path)}: {what} "
+        f"({len(record.text.splitlines())} lines, {record.model}, "
+        f"cached in {index.display_path(str(preamble.cache_path()))})"
+    )
+    if args.show:
+        print()
+        print(record.text)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "ai":
         return _run_ai(args)
+    if args.command == "preamble":
+        return _run_preamble(args)
     if args.command == "scan":
         return _run_scan(args)
     return _run_tui(args)

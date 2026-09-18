@@ -12,12 +12,14 @@ references keep resolving.
 ## Components
 
 ```text
-texman/cli.py        argparse front door: texman, texman scan, texman ai
+texman/cli.py        argparse front door: texman, texman scan/ai/preamble
 texman/index.py      directory walk + SQLite persistence (no UI, no network)
 texman/documents.py  the preamble.tex template and documents made from it
+texman/preamble.py   the cached summary of that template (no network of its own)
 texman/tui.py        Textual browser, description editor, scan worker
 texman/ai.py         JSON-in/text-out OpenAI helper (the only network code)
-nvim/texman.lua      :TexAI, :TexAIFix, :TexAIMap; owns all buffer modification
+nvim/texman.lua      :TexAI, :TexAIFix, :TexAIMap, :TexPreamble; owns all
+                     buffer modification
 ```
 
 Dependencies point one way: `cli` imports the others lazily, `tui` imports
@@ -249,30 +251,77 @@ state with the app still running. Neovim's absence is therefore checked with
 `texman ai` is an internal, single-purpose process with a small contract:
 
 - **Input:** one JSON object on stdin — `mode` (`insert`, the default, `fix`,
-  or `keymap`), `prompt` (nonempty string), and for the two document modes
-  `line` (one-based int) and `buffer_lines` (array of strings), with `line`
-  within `1 … len(buffer_lines) + 1` for an insert and within the buffer for a
-  fix. A `keymap` request carries Neovim state instead: `keymap_file_text`,
-  `mapleader`, `maplocalleader`, and `mapped_keys`.
-- **Output:** on success, only the generated fragment on stdout -- LaTeX, or
-  Lua for a mapping -- exit 0.
+  `keymap`, or `digest`), `prompt` (nonempty string), and for the two document
+  modes `line` (one-based int) and `buffer_lines` (array of strings), with
+  `line` within `1 … len(buffer_lines) + 1` for an insert and within the buffer
+  for a fix. Document modes also take `full` (boolean) and `window` (positive
+  int). A `keymap` request carries Neovim state instead: `keymap_file_text`,
+  `mapleader`, `maplocalleader`, and `mapped_keys`. A `digest` request carries
+  only `preamble_text`, and has no prompt.
+- **Output:** on success, only the generated fragment on stdout -- LaTeX, Lua
+  for a mapping, or plain text for a digest -- exit 0.
 - **Failure:** invalid input, missing configuration, API error, refusal,
   incomplete response, or empty output all exit nonzero with a short message on
   stderr and nothing on stdout.
-- It never writes to a source file. Insertion belongs to Neovim.
+- It never writes to a source file. Insertion belongs to Neovim. The one file it
+  writes at all is its own preamble-digest cache, described below.
 
 Configuration comes from the environment: `OPENAI_API_KEY` and
-`TEXMAN_OPENAI_MODEL`, an explicit model ID rather than a moving alias. The
-client is constructed only inside a generation request, with a 60-second timeout
-and `max_retries=0`; the user retries explicitly.
+`TEXMAN_OPENAI_MODEL`, an explicit model ID rather than a moving alias, plus
+`TEXMAN_OPENAI_MINI_MODEL` for the preamble digest and `TEXMAN_WINDOW_LINES`
+for the context window. The client is constructed only inside a generation
+request, with a 60-second timeout and `max_retries=0`; the user retries
+explicitly.
 
-Context is bounded and built only from the buffer the user is editing — no other
-indexed file is read and `\input` is not followed. Up to the first 100 lines
-supply packages and macros, and up to 40 lines on each side of the insertion
-point supply local conventions. Overlapping ranges are merged, omitted stretches
-are labelled (`[... lines 101-109 omitted ...]`), and the insertion point is
-marked in place. If the result exceeds 24,000 characters, the preamble is shed
-first and the lines nearest the insertion point are kept longest.
+### The preamble digest
+
+Every document made with `n` starts from one `preamble.tex`, so its packages and
+macros are the conventions a snippet has to match. Sending that file with every
+request would be wasteful and would crowd out the document, so it is summarised
+once by the cheaper `TEXMAN_OPENAI_MINI_MODEL` and the summary is cached at
+`$XDG_DATA_HOME/texman/preamble-digest.json`, beside the catalog.
+
+`texman/preamble.py` owns the cache and knows nothing about OpenAI:
+`ensure_digest` takes the function that produces a summary, so the caller owns
+the request and tests stub it. The cache is keyed on the preamble's SHA-256, so
+editing `preamble.tex` invalidates it and leaving it alone costs nothing. Writes
+go through a temporary file and `os.replace`, so a crash never leaves half a
+cache, and a cache that is absent, unreadable, malformed, or describes different
+contents is a miss rather than an error.
+
+`texman preamble` refreshes it on demand (`--force`, `--show`) and reports any
+failure, because the user asked for it. An editing request seeds it silently
+through `resolve_digest`, which swallows every failure: a missing preamble, an
+unset mini model, or a failed summary leaves `:TexAI` working exactly as it did
+before the digest existed. Nothing here needs a key when the cache is current,
+because `digest_producer` builds the client inside the producer, not around it.
+
+### Bounded context
+
+Context is built only from the buffer the user is editing — no other indexed
+file is read and `\input` is not followed; the shared preamble template is the
+single named exception, and even that is read once per edit, not per request.
+
+Every context line is rendered as `   765| text`. The numbers are what makes a
+prompt like "look at the previous 30 lines" answerable: without them the model
+cannot tell which line is which, and across an omitted stretch it cannot even
+count. Overlapping ranges are merged, omitted stretches are labelled
+(`[... lines 101-139 omitted ...]`), and the insertion point is marked in place.
+
+Two shapes:
+
+- **Windowed**, the default. Up to the first 100 lines supply packages and
+  macros — 30 when a digest already names the shared ones — and up to
+  `TEXMAN_WINDOW_LINES` (default 10) lines on each side of the insertion point
+  supply local conventions. Capped at 24,000 characters.
+- **Whole file**, from `:TexAI!` or `TEXMAN_FULL_FILE=1`. Every line goes out,
+  numbered, so the prompt may refer to any of them. Capped at 120,000
+  characters.
+
+When a result exceeds its cap, the preamble is shed first and the lines nearest
+the insertion point are kept longest. A whole-file request too large to send
+falls back to a 100-line window rather than shrinking the buffer one line at a
+time, which would re-render the whole document on every step.
 
 The instructions require a bare LaTeX fragment: no Markdown, no prose, no
 repeated surrounding text, no document wrapper unless asked, matching
@@ -323,6 +372,11 @@ and it leaves `/` alone so ordinary search is unaffected. If the name is already
 taken, `setup` reports the conflict and returns `false`;
 `require('texman').setup({ command = 'OtherName' })` picks another.
 
+The command takes a bang. `:TexAI!` sets `full` on the request, sending the
+whole buffer as numbered context so the prompt may refer to any part of it;
+`TEXMAN_FULL_FILE=1` makes that the default. The progress notification says
+which shape was used, so the two are never confused after the fact.
+
 One request per buffer at a time, tracked in a table keyed by buffer handle and
 cleared on every exit path, including failures.
 
@@ -367,6 +421,15 @@ before that call syncs undo, which keeps the insertion from merging into the
 user's previous edit: one `u` removes the snippet and nothing else. The file is
 never saved automatically.
 
+`:TexPreamble` runs `texman preamble` rather than `texman ai`, which is why the
+runner takes an argv and an optional stdin; `send` is the thin wrapper that
+supplies `{'texman','ai'}` and the encoded JSON. It has its own concurrency key,
+so summarising and generating can overlap but two summaries cannot. Running it
+is optional — the first `:TexAI` after an edit does the same work — but it moves
+the cost out of the way of a generation and is where a misconfiguration is
+reported, since `:TexAI` stays silent about a failed summary by design. It is
+registered optionally, like `:TexAIFix`, so losing it never costs `:TexAI`.
+
 `:TexAIMap <description>` reuses `send` with the mappings file, not a buffer,
 as its concurrency key, so a mapping request and a document request can
 overlap but two mapping requests cannot. The buffer re-checks live in a
@@ -388,7 +451,7 @@ paths instead of a pattern, which avoids pattern-escaping the config path.
 
 ## Verification
 
-- `python -m unittest discover -s tests -t .` — 213 checks. `test_index.py`
+- `python -m unittest discover -s tests -t .` — 269 checks. `test_index.py`
   builds a temporary fixture with nested files, hidden folders, duplicate
   filenames, spaces, an uppercase extension, a symlink loop, a broken link, and
   a `chmod 000` directory, and covers description persistence across restarts,
@@ -398,17 +461,25 @@ paths instead of a pattern, which avoids pattern-escaping the config path.
   app headlessly with Textual's pilot, stubbing `suspend()` and
   `subprocess.run`, and covers counts and sequences (including that `;s` never
   stops a scan and that digits type into the filter), the preamble, new
-  documents, and late messages arriving after teardown. `test_cli.py` runs the
-  real command as a subprocess, including `texman ai` failure paths that need
-  no API key.
-- `nvim --headless -u NONE -l tests/test_nvim.lua` — 146 checks against a fake
+  documents, and late messages arriving after teardown. `test_preamble.py`
+  covers the digest cache — round trips, staleness after an edit, a corrupt
+  cache treated as a miss, clipping, and atomic writes — with the summary
+  function stubbed, so it makes no request at all. `test_cli.py` runs the real
+  command as a subprocess, including `texman ai` and `texman preamble` failure
+  paths that need no API key. Every check in `test_ai.py` runs with XDG pointed
+  at a temporary directory, because a generation request now looks up a cached
+  summary and would otherwise touch the developer's own cache.
+- `nvim --headless -u NONE -l tests/test_nvim.lua` — 169 checks against a fake
   `texman` executable on `PATH`, covering insertion before the first and a
   middle line, appending, invalid lines and prompts, unsaved context,
   backslashes in prompts, one-step undo, switched buffers, changed and closed
   buffers, duplicate requests, helper failure, empty output, a missing helper,
   every log shape `:TexAIFix` understands and every refusal, and for
   `:TexAIMap` the draft-review-write flow, one-step undo, refusal of Lua that
-  does not compile, and a broken mappings file at startup.
+  does not compile, and a broken mappings file at startup. It also covers the
+  bang and `TEXMAN_FULL_FILE` reaching the request as `full`, and `:TexPreamble`
+  running `texman preamble`, passing `--force` for a bang, and reporting
+  failure, silence, and a second summary started while one runs.
 - Automated tests only ever scan a temporary fixture, and they always stub the
   client. Scanning `/` and one live request per command are manual checks,
   recorded in the README.

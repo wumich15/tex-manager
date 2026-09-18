@@ -1,8 +1,10 @@
 -- texman: generate and repair LaTeX from inside Neovim.
 --
 --   :TexAI <line> <prompt>   insert generated LaTeX before <line>
+--   :TexAI! <line> <prompt>  the same, with the whole file as context
 --   :TexAIFix [guidance]     replace the line the compiler blamed
 --   :TexAIMap <prompt>       draft a key mapping into texman's mappings file
+--   :TexPreamble             summarise the preamble template, once, and cache it
 --
 -- All Ex commands start with an uppercase letter as Neovim requires, and `/`
 -- is left alone so ordinary search keeps working. Insertion and replacement
@@ -13,6 +15,7 @@ local M = {}
 local DEFAULT_COMMAND = 'TexAI'
 local DEFAULT_FIX_COMMAND = 'TexAIFix'
 local DEFAULT_MAP_COMMAND = 'TexAIMap'
+local DEFAULT_PREAMBLE_COMMAND = 'TexPreamble'
 -- Mappings drafted by :TexAIMap live in their own file, loaded by `setup()`
 -- inside pcall, so a bad mapping can never break Neovim's startup. init.lua
 -- itself is never edited.
@@ -36,10 +39,15 @@ local REQUEST_TIMEOUT_MS = 90000
 -- Logs are normally tens of kilobytes; this only guards a pathological one.
 local MAX_LOG_BYTES = 500000
 
--- One active request per target, keyed by buffer handle, or by KEYMAP_KEY for
--- the mappings file.
+-- One active request per target, keyed by buffer handle, or by one of these
+-- for the targets that are not buffers.
 local active = {}
 local KEYMAP_KEY = 'keymap'
+local PREAMBLE_KEY = 'preamble'
+local BUSY_MESSAGE = {
+  [KEYMAP_KEY] = 'a mapping request is already running',
+  [PREAMBLE_KEY] = 'the preamble is already being summarised',
+}
 
 local function notify(message, level)
   vim.notify('texman: ' .. message, level or vim.log.levels.INFO)
@@ -100,19 +108,16 @@ end
 
 -- ---------------------------------------------------------------- requests
 
---- Run one helper request, handing its output to `on_output` on success.
+--- Run one `texman` subcommand, handing its output to `on_output` on success.
 ---
---- `key` limits concurrency: one request per buffer, or per mappings file.
---- `on_output` receives the helper's stdout and returns a message describing
---- what changed, plus an optional log level. `empty` is the message for a
---- helper that printed nothing.
-local function send(key, payload, on_output, progress, empty)
+--- `key` limits concurrency: one request per buffer, per mappings file, or per
+--- preamble. `stdin` is the text to write to the process, or nil for none.
+--- `on_output` receives stdout and returns a message describing what changed,
+--- plus an optional log level. `empty` is the message for a command that
+--- printed nothing.
+local function run(key, argv, stdin, on_output, progress, empty)
   if active[key] then
-    notify(
-      key == KEYMAP_KEY and 'a mapping request is already running'
-        or 'a request is already running for this buffer',
-      vim.log.levels.WARN
-    )
+    notify(BUSY_MESSAGE[key] or 'a request is already running for this buffer', vim.log.levels.WARN)
     return
   end
 
@@ -150,17 +155,25 @@ local function send(key, payload, on_output, progress, empty)
   end
 
   active[key] = true
-  local ok, launch_error = pcall(vim.system, { 'texman', 'ai' }, {
-    stdin = vim.json.encode(payload),
+  local ok, launch_error = pcall(vim.system, argv, {
+    stdin = stdin,
     text = true,
     timeout = REQUEST_TIMEOUT_MS,
   }, on_exit)
   if not ok then
     active[key] = nil
-    notify('could not run `texman ai`: ' .. tostring(launch_error), vim.log.levels.ERROR)
+    notify(
+      'could not run `' .. table.concat(argv, ' ') .. '`: ' .. tostring(launch_error),
+      vim.log.levels.ERROR
+    )
     return
   end
   notify(progress)
+end
+
+--- Send one JSON request to `texman ai`, which is how every generation works.
+local function send(key, payload, on_output, progress, empty)
+  return run(key, { 'texman', 'ai' }, vim.json.encode(payload), on_output, progress, empty)
 end
 
 --- Wrap `apply(buf, output)` so it runs only if `buf` is still as it was.
@@ -198,7 +211,12 @@ local function parse_args(args)
 end
 
 --- Insert generated LaTeX before line `L`; valid values are 1 through N + 1.
-function M.request(args)
+---
+--- With `bang` (`:TexAI!`) the whole buffer goes out as context, numbered, so
+--- the prompt may refer to any part of it -- "look at the previous 30 lines".
+--- Without it only the lines around `L` do. `TEXMAN_FULL_FILE=1` makes the
+--- bang the default for someone who always wants it.
+function M.request(args, bang)
   local line, prompt, err = parse_args(args)
   if err then
     notify(err, vim.log.levels.ERROR)
@@ -220,10 +238,12 @@ function M.request(args)
     return
   end
 
+  local full = bang == true or vim.env.TEXMAN_FULL_FILE == '1'
   local payload = {
     mode = 'insert',
     line = line,
     prompt = prompt,
+    full = full,
     -- In-memory lines, so unsaved edits are part of the context.
     buffer_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, true),
   }
@@ -236,7 +256,16 @@ function M.request(args)
     return string.format('inserted %d line(s) before line %d; press u to undo', #lines, line)
   end
 
-  send(buf, payload, guarded(buf, apply), string.format('generating LaTeX for line %d …', line))
+  send(
+    buf,
+    payload,
+    guarded(buf, apply),
+    string.format(
+      'generating LaTeX for line %d (%s) …',
+      line,
+      full and string.format('whole file, %d lines', count) or 'nearby lines'
+    )
+  )
 end
 
 -- ------------------------------------------------------- :TexAIFix (repair)
@@ -640,6 +669,26 @@ function M.map(args)
   send(KEYMAP_KEY, payload, on_output, 'drafting a key mapping …', 'the helper produced no Lua')
 end
 
+-- ------------------------------------------------- :TexPreamble (digest)
+
+--- Summarise the preamble template once, so later requests can match it.
+---
+--- The summary is cached on disk against the preamble's contents, so this is
+--- the only time the file is read or sent: `:TexAI` inlines the cached summary
+--- and makes no extra request. Running it by hand is optional -- the first
+--- `:TexAI` after an edit does the same thing -- but it moves the cost out of
+--- the way of a generation, and it is where a misconfiguration is reported.
+--- With `!` the summary is made again even when it is still current.
+function M.preamble(bang)
+  local argv = { 'texman', 'preamble' }
+  if bang then
+    table.insert(argv, '--force')
+  end
+  run(PREAMBLE_KEY, argv, nil, function(output)
+    return first_line(output) or 'the preamble summary is up to date'
+  end, 'summarising the preamble …', 'texman printed nothing')
+end
+
 -- ------------------------------------------------------------------- setup
 
 local function register(name, handler, description)
@@ -663,21 +712,24 @@ end
 
 --- Register the Ex commands and load the mappings file.
 ---
---- Pass `{ command = 'OtherName' }`, `{ fix_command = 'OtherName' }`, or
---- `{ map_command = 'OtherName' }` if a name is already taken, and
---- `{ keymaps_file = '/path/to/file.lua' }` to keep drafted mappings elsewhere
---- than `stdpath('config')/texman-keymaps.lua`.
+--- Pass `{ command = 'OtherName' }`, `{ fix_command = 'OtherName' }`,
+--- `{ map_command = 'OtherName' }`, or `{ preamble_command = 'OtherName' }` if
+--- a name is already taken, and `{ keymaps_file = '/path/to/file.lua' }` to
+--- keep drafted mappings elsewhere than
+--- `stdpath('config')/texman-keymaps.lua`.
 function M.setup(opts)
   opts = opts or {}
   local name = opts.command or DEFAULT_COMMAND
   local fix_name = opts.fix_command or DEFAULT_FIX_COMMAND
   local map_name = opts.map_command or DEFAULT_MAP_COMMAND
+  local preamble_name = opts.preamble_command or DEFAULT_PREAMBLE_COMMAND
 
   local ok = register(name, function(cmd)
-    M.request(cmd.args)
+    M.request(cmd.args, cmd.bang)
   end, {
     nargs = '+',
-    desc = 'Insert generated LaTeX before the given line',
+    bang = true,
+    desc = 'Insert generated LaTeX before the given line (! sends the whole file)',
   })
   if not ok then
     return false
@@ -704,6 +756,18 @@ function M.setup(opts)
     desc = 'Draft a key mapping from a description into the texman mappings file',
   }) then
     M.map_command_name = map_name
+  end
+
+  -- Also optional: `:TexAI` seeds the summary by itself, so losing the command
+  -- costs only the ability to refresh it on purpose.
+  if register(preamble_name, function(cmd)
+    M.preamble(cmd.bang)
+  end, {
+    nargs = 0,
+    bang = true,
+    desc = 'Summarise the preamble template so :TexAI matches its packages and macros',
+  }) then
+    M.preamble_command_name = preamble_name
   end
 
   -- Writing the mappings file is how a drafted mapping is accepted, so that is

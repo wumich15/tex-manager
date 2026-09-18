@@ -6,7 +6,8 @@
 -- makes no API calls. It covers insertion before the first and a middle line,
 -- appending, invalid lines, unsaved context, one-step undo, switched buffers,
 -- changed and closed buffers, helper failure, log-driven fixes, and drafting
--- key mappings into the mappings file.
+-- key mappings into the mappings file, whole-file context, and the cached
+-- preamble summary.
 
 local script_dir = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':p:h')
 local module_path = script_dir .. '/../nvim/texman.lua'
@@ -14,11 +15,33 @@ local module_path = script_dir .. '/../nvim/texman.lua'
 local tmp = vim.fn.tempname()
 vim.fn.mkdir(tmp, 'p')
 local capture = tmp .. '/request.json'
+local argv_capture = tmp .. '/argv.txt'
 
 -- ------------------------------------------------------------------ fake helper
 
 local fake = tmp .. '/texman'
 local fake_source = [==[#!/bin/sh
+if [ -n "$TEXMAN_FAKE_ARGV" ]; then
+  printf '%s' "$*" > "$TEXMAN_FAKE_ARGV"
+fi
+if [ "$1" = "preamble" ]; then
+  case "${TEXMAN_FAKE_PREAMBLE:-ok}" in
+    ok)
+      echo "~/.config/texman/preamble.tex: summarised (4 lines, mini-x, cached in ~/.local/share/texman/preamble-digest.json)"
+      ;;
+    slow)
+      sleep 1
+      echo "~/.config/texman/preamble.tex: summarised (4 lines, mini-x)"
+      ;;
+    empty)
+      ;;
+    fail)
+      echo "texman preamble: TEXMAN_OPENAI_MINI_MODEL is not set" >&2
+      exit 1
+      ;;
+  esac
+  exit 0
+fi
 payload=$(cat)
 if [ -n "$TEXMAN_FAKE_CAPTURE" ]; then
   printf '%s' "$payload" > "$TEXMAN_FAKE_CAPTURE"
@@ -148,9 +171,14 @@ local keymap_snippet = "vim.keymap.set('n', '<leader>zz', function() vim.notify(
 local sample = { '\\documentclass{article}', '\\begin{document}', 'Hello.', '\\end{document}' }
 local snippet = { '\\begin{equation}', '  x = 1', '\\end{equation}' }
 
-local function run(args)
+local function run(args, bang)
   notes = {}
-  texman.request(args)
+  texman.request(args, bang)
+end
+
+--- Read back the JSON the fake helper captured.
+local function captured()
+  return vim.json.decode(table.concat(vim.fn.readfile(capture), '\n'))
 end
 
 -- --------------------------------------------------------------------- setup
@@ -796,6 +824,102 @@ do
   texman.keymaps_file = tmp .. '/absent-keymaps.lua'
   ok('a missing mappings file is fine', texman.load_keymaps() == true)
   texman.keymaps_file = saved
+end
+
+-- ------------------------------------------------------- whole-file context
+
+do
+  vim.env.TEXMAN_FAKE_CAPTURE = capture
+  local lines = {}
+  for i = 1, 40 do
+    lines[i] = 'line ' .. i
+  end
+
+  local buf = new_tex_buffer(lines)
+  run('20 add an equation')
+  ok('a windowed request completes', wait_for('inserted 3 line'), last_note())
+  local sent = captured()
+  eq('a plain :TexAI is not a whole-file request', sent.full, false)
+  eq('the whole buffer still reaches the helper', #sent.buffer_lines, 40)
+
+  notes = {}
+  run('20 add an equation', true)
+  ok('a bang request completes', wait_for('inserted 3 line'), last_note())
+  eq('a bang makes it a whole-file request', captured().full, true)
+
+  -- A fresh buffer, because the insertions above lengthened the last one.
+  local counted = new_tex_buffer(lines)
+  notes = {}
+  run('20 look at the previous 30 lines', true)
+  ok('the bang is announced with the real line count',
+    string.match(last_note(), 'whole file, 40 lines') ~= nil, last_note())
+  ok('the counted request completes', wait_for('inserted 3 line'), last_note())
+  vim.api.nvim_buf_delete(counted, { force = true })
+  vim.api.nvim_set_current_buf(buf)
+
+  vim.env.TEXMAN_FULL_FILE = '1'
+  notes = {}
+  run('20 add an equation')
+  ok('TEXMAN_FULL_FILE request completes', wait_for('inserted 3 line'), last_note())
+  eq('TEXMAN_FULL_FILE makes the bang the default', captured().full, true)
+  vim.env.TEXMAN_FULL_FILE = nil
+
+  notes = {}
+  run('20 add an equation')
+  ok('the default returns when TEXMAN_FULL_FILE is unset',
+    wait_for('inserted 3 line'), last_note())
+  eq('and the request is windowed again', captured().full, false)
+
+  vim.api.nvim_buf_delete(buf, { force = true })
+  vim.env.TEXMAN_FAKE_CAPTURE = nil
+end
+
+-- ---------------------------------------------------------- :TexPreamble
+
+ok('setup registers :TexPreamble', texman.preamble_command_name == 'TexPreamble')
+ok(':TexPreamble exists', vim.api.nvim_get_commands({})['TexPreamble'] ~= nil)
+
+do
+  vim.env.TEXMAN_FAKE_ARGV = argv_capture
+  notes = {}
+  texman.preamble()
+  ok('summarising is reported', string.match(last_note(), 'summarising') ~= nil, last_note())
+  ok('the summary completes', wait_for('summarised'), last_note())
+  eq('it runs `texman preamble`', vim.fn.readfile(argv_capture)[1], 'preamble')
+
+  notes = {}
+  texman.preamble(true)
+  ok('a forced summary completes', wait_for('summarised'), last_note())
+  eq('a bang forces a refresh', vim.fn.readfile(argv_capture)[1], 'preamble --force')
+  vim.env.TEXMAN_FAKE_ARGV = nil
+end
+
+do
+  vim.env.TEXMAN_FAKE_PREAMBLE = 'fail'
+  notes = {}
+  texman.preamble()
+  ok('a failed summary is reported', wait_for('TEXMAN_OPENAI_MINI_MODEL'), last_note())
+  eq('and reported as an error', notes[#notes].level, vim.log.levels.ERROR)
+  vim.env.TEXMAN_FAKE_PREAMBLE = nil
+end
+
+do
+  vim.env.TEXMAN_FAKE_PREAMBLE = 'empty'
+  notes = {}
+  texman.preamble()
+  ok('a silent summary is reported', wait_for('printed nothing'), last_note())
+  vim.env.TEXMAN_FAKE_PREAMBLE = nil
+end
+
+do
+  vim.env.TEXMAN_FAKE_PREAMBLE = 'slow'
+  notes = {}
+  texman.preamble()
+  texman.preamble()
+  ok('a second summary is refused while one runs',
+    string.match(last_note(), 'already being summarised') ~= nil, last_note())
+  ok('the first summary still completes', wait_for('summarised'), last_note())
+  vim.env.TEXMAN_FAKE_PREAMBLE = nil
 end
 
 -- ------------------------------------------------------------------ summary

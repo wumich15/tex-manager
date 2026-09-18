@@ -31,6 +31,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for how it works internally.
   it in any directory.
 - `:TexAI 25 Add a TikZ diagram of a three-node directed cycle` inserts
   generated LaTeX before line 25 of the buffer you are editing.
+- `:TexAI! 765 Look at the previous 30 lines and make a diagram for this` sends
+  the whole file, with line numbers, so the prompt can point at any part of it.
+- `:TexPreamble` summarises your `preamble.tex` once, so everything `:TexAI`
+  writes matches the packages and macros you actually load.
 - `:TexAIFix` reads your compiler's log, finds the line LaTeX complained about,
   and replaces it with a corrected version.
 - `:TexAIMap a shortcut for an enumerate environment with the cursor after the
@@ -198,11 +202,24 @@ File management needs neither of these variables; `:TexAI` needs both.
    ```sh
    export OPENAI_API_KEY="<your-own-api-key>"
    export TEXMAN_OPENAI_MODEL="<model-id-available-to-your-project>"
+   export TEXMAN_OPENAI_MINI_MODEL="<small-model-id-available-to-your-project>"
    ```
+
+   `TEXMAN_OPENAI_MINI_MODEL` is used for one small job — summarising your
+   preamble, once — so a cheap model is the right choice. Without it `:TexAI`
+   still works; it simply sends part of the document's own opening lines
+   instead of the summary.
 
    To keep these settings, put them in your own shell configuration
    (`~/.zshrc`), never in a file tracked by this repository. API usage is billed
    to your own OpenAI account.
+
+   Two optional variables tune how much of the document is sent:
+
+   | Variable | Default | Effect |
+   | --- | --- | --- |
+   | `TEXMAN_WINDOW_LINES` | `10` | Lines sent each side of the target line |
+   | `TEXMAN_FULL_FILE` | unset | `1` makes `:TexAI` behave like `:TexAI!` |
 
 3. Copy the Lua module into your Neovim configuration:
 
@@ -230,9 +247,10 @@ File management needs neither of these variables; `:TexAI` needs both.
    require('texman').setup({ command = 'TexGen' })
    ```
 
-   `fix_command` and `map_command` rename `:TexAIFix` and `:TexAIMap` the same
-   way. `setup` also loads `~/.config/nvim/texman-keymaps.lua`, the file
-   `:TexAIMap` writes to; `keymaps_file = '/some/other/path.lua'` moves it.
+   `fix_command`, `map_command`, and `preamble_command` rename `:TexAIFix`,
+   `:TexAIMap`, and `:TexPreamble` the same way. `setup` also loads
+   `~/.config/nvim/texman-keymaps.lua`, the file `:TexAIMap` writes to;
+   `keymaps_file = '/some/other/path.lua'` moves it.
 
 ## Generating LaTeX
 
@@ -254,10 +272,53 @@ The fragment is inserted **before** line 10. Valid line numbers are `1` through
   limit, timeout, no connection) are reported in a single short message; run the
   command again to retry.
 
-Only the prompt and a bounded slice of the current buffer are sent: up to the
-first 100 lines for packages and macros, and up to 40 lines on each side of the
-insertion point. No other file in your catalog is read, and `\input` references
-are not followed.
+### How much of the file is sent
+
+Context lines are sent with their real line numbers, as `   765| text`, so your
+prompt can refer to the document directly.
+
+By default only a slice goes out: the document's opening lines for packages and
+macros, and `TEXMAN_WINDOW_LINES` (10) lines on each side of the target.
+Omitted stretches are labelled, so nothing looks contiguous that is not.
+
+Add `!` to send the whole file instead:
+
+```vim
+:TexAI! 765 Look at the previous 30 lines and make a diagram for this
+```
+
+That is what makes a prompt like this one work — with the whole numbered file in
+front of it, "the previous 30 lines" means lines 735 to 764. Very large
+documents fall back to a wide window, and the notification tells you which shape
+was used. Set `TEXMAN_FULL_FILE=1` if you always want the bang.
+
+No other file in your catalog is read, and `\input` references are not followed.
+Your shared `preamble.tex` is the one exception, and it is summarised once
+rather than sent — see below.
+
+## Matching your preamble
+
+Everything `n` creates starts from one `preamble.tex`, so its packages and
+macros are what generated LaTeX should match. Rather than send that file with
+every request, texman summarises it once:
+
+```vim
+:TexPreamble
+```
+
+The summary is cached at `~/.local/share/texman/preamble-digest.json` and
+travels with every later `:TexAI` and `:TexAIFix`. Edit `preamble.tex` and the
+next request summarises it again; leave it alone and it costs nothing at all —
+no file read, no extra request.
+
+Running the command is optional: the first `:TexAI` after an edit does the same
+work by itself. It is worth running by hand because it moves that cost out of
+the way of a generation, and because it is the only place a misconfiguration is
+reported — `:TexAI` deliberately stays quiet about a failed summary and simply
+carries on without it.
+
+- `:TexPreamble!` summarises again even when the cache is current.
+- From a shell, `texman preamble --show` prints the summary it has.
 
 ## Fixing a compile error
 
@@ -348,20 +409,23 @@ of keys already mapped (left-hand sides only) so the draft avoids them.
 1. Run `texman` and wait for files to appear.
 2. Select a file, press `d`, type a description, press Enter.
 3. Press Enter to open it in Neovim.
-4. Try `:TexAI 10 Add an aligned derivation of the quadratic formula`, with a
+4. Run `:TexPreamble` once, so what follows matches your own packages.
+5. Try `:TexAI 10 Add an aligned derivation of the quadratic formula`, with a
    line number that exists in that buffer.
-5. Press `u` to undo the insertion, or `:write` to keep it, then `:q` to return
+6. Press `u` to undo the insertion, or `:write` to keep it, then `:q` to return
    to the catalog.
 
 ## Tests
 
 ```sh
-python -m unittest discover -s tests -t .       # 213 checks
-nvim --headless -u NONE -l tests/test_nvim.lua  # 146 checks
+python -m unittest discover -s tests -t .       # 269 checks
+nvim --headless -u NONE -l tests/test_nvim.lua  # 169 checks
 ```
 
 Automated tests only scan a temporary fixture, never your whole machine, and the
-OpenAI client is always stubbed, so they make no paid API calls.
+OpenAI client is always stubbed, so they make no paid API calls. They also point
+`XDG_DATA_HOME` at a temporary directory, so your own catalog and preamble
+summary are never read or written.
 
 ### Verified by hand
 
@@ -387,6 +451,10 @@ One real `:TexAI` request against a live OpenAI project, with
 - A single `u` removed the whole snippet and kept the unsaved edit.
 - A second request in the same buffer worked, so the per-buffer request flag
   clears correctly.
+
+The preamble summary and whole-file context (`:TexPreamble`, `:TexAI!`,
+`TEXMAN_WINDOW_LINES`) are **not yet verified against a live project** — they are
+covered by stubbed tests only, and mocked output never proves API connectivity.
 
 `:TexAIFix` was verified against two real `latexmk` failures:
 

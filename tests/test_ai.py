@@ -1,7 +1,10 @@
 """Checks for the `texman ai` contract.
 
 The OpenAI client is always a stub, so these tests make no paid API calls and
-need neither a key nor a network connection.
+need neither a key nor a network connection. The whole module also runs with
+XDG pointed at a temporary directory, because a generation request now looks up
+a cached preamble summary and would otherwise read and write the developer's
+own cache.
 """
 
 from __future__ import annotations
@@ -9,11 +12,37 @@ from __future__ import annotations
 import io
 import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from texman import ai
+from texman import ai, documents, preamble
+
+_isolation: tempfile.TemporaryDirectory | None = None
+_environment: object | None = None
+
+
+def setUpModule() -> None:
+    """Keep every check in this file away from the developer's own files."""
+    global _isolation, _environment
+    _isolation = tempfile.TemporaryDirectory()
+    _environment = mock.patch.dict(
+        os.environ,
+        {
+            "XDG_DATA_HOME": os.path.join(_isolation.name, "data"),
+            "XDG_CONFIG_HOME": os.path.join(_isolation.name, "config"),
+        },
+    )
+    _environment.start()
+    for name in (documents.PREAMBLE_ENV, ai.MINI_MODEL_ENV, ai.WINDOW_ENV):
+        os.environ.pop(name, None)
+
+
+def tearDownModule() -> None:
+    _environment.stop()
+    _isolation.cleanup()
 
 
 def response(
@@ -294,12 +323,13 @@ class ContextTests(unittest.TestCase):
     def test_includes_preamble_and_both_windows(self) -> None:
         buffer = [f"line{i}" for i in range(1, 301)]
         context = ai.build_context(buffer, 150)
-        self.assertIn("line1", context)
-        self.assertIn("line100", context)
-        self.assertIn("line110", context)  # 40 lines before the insertion point
-        self.assertIn("line189", context)  # 40 lines after it
-        self.assertNotIn("line105", context)
-        self.assertNotIn("line200", context)
+        self.assertIn("line1\n", context)
+        self.assertIn("line100\n", context)
+        # WINDOW_LINES each side of the insertion point.
+        self.assertIn("line140\n", context)
+        self.assertIn("line159\n", context)
+        self.assertNotIn("line139\n", context)
+        self.assertNotIn("line160\n", context)
 
     def test_marks_the_insertion_point(self) -> None:
         context = ai.build_context(["a", "b", "c"], 2)
@@ -310,8 +340,8 @@ class ContextTests(unittest.TestCase):
     def test_labels_omitted_sections(self) -> None:
         buffer = [f"line{i}" for i in range(1, 301)]
         context = ai.build_context(buffer, 150)
-        self.assertIn("[... lines 101-109 omitted ...]", context)
-        self.assertIn("[... lines 190-300 omitted ...]", context)
+        self.assertIn("[... lines 101-139 omitted ...]", context)
+        self.assertIn("[... lines 160-300 omitted ...]", context)
 
     def test_append_position_is_described(self) -> None:
         context = ai.build_context(["a"], 2)
@@ -330,7 +360,61 @@ class ContextTests(unittest.TestCase):
         context = ai.build_context(buffer, 200)
         self.assertLessEqual(len(context), ai.MAX_CONTEXT_CHARS)
         self.assertIn("INSERT THE NEW LATEX HERE, before line 200", context)
+        # The lines on either side of the insertion point survive the trimming.
+        self.assertIn("   199| ", context)
+        self.assertIn("   200| ", context)
+        self.assertIn(" omitted ...]", context)
+
+    def test_a_wide_window_sheds_the_preamble_first(self) -> None:
+        buffer = ["x" * 500 for _ in range(400)]
+        context = ai.build_context(buffer, 200, window=40)
+        self.assertLessEqual(len(context), ai.MAX_CONTEXT_CHARS)
         self.assertIn("[... lines 1-", context)
+        self.assertIn("INSERT THE NEW LATEX HERE, before line 200", context)
+
+    # ------------------------------------------------------- line numbers
+
+    def test_every_context_line_carries_its_number(self) -> None:
+        buffer = [f"line{i}" for i in range(1, 12)]
+        context = ai.build_context(buffer, 6)
+        self.assertIn("     1| line1", context)
+        self.assertIn("    11| line11", context)
+        # The number must be the real one, not an offset into the excerpt.
+        buffer = [f"line{i}" for i in range(1, 301)]
+        context = ai.build_context(buffer, 150)
+        self.assertIn("   149| line149", context)
+        self.assertIn("   150| line150", context)
+
+    # --------------------------------------------------------- whole file
+
+    def test_full_sends_every_line_with_no_gaps(self) -> None:
+        buffer = [f"line{i}" for i in range(1, 501)]
+        context = ai.build_context(buffer, 400, full=True)
+        self.assertNotIn("omitted", context)
+        self.assertIn("     1| line1\n", context)
+        self.assertIn("   250| line250\n", context)
+        self.assertIn("   500| line500", context)
+        self.assertIn("[INSERT THE NEW LATEX HERE, before line 400]", context)
+
+    def test_full_marks_an_append_at_the_end(self) -> None:
+        buffer = [f"line{i}" for i in range(1, 6)]
+        context = ai.build_context(buffer, 6, full=True)
+        self.assertIn("     5| line5", context)
+        self.assertIn("at the end of the document (line 6)", context)
+
+    def test_full_falls_back_to_a_window_when_too_large(self) -> None:
+        buffer = ["x" * 500 for _ in range(1000)]
+        context = ai.build_context(buffer, 500, full=True)
+        self.assertLessEqual(len(context), ai.MAX_FULL_CONTEXT_CHARS)
+        self.assertIn(" omitted ...]", context)
+        self.assertIn("INSERT THE NEW LATEX HERE, before line 500", context)
+
+    def test_full_uses_the_larger_cap(self) -> None:
+        # Comfortably over the windowed cap, comfortably under the full one.
+        buffer = ["x" * 60 for _ in range(800)]
+        context = ai.build_context(buffer, 400, full=True)
+        self.assertGreater(len(context), ai.MAX_CONTEXT_CHARS)
+        self.assertNotIn("omitted", context)
 
     def test_request_body_bounds_the_context(self) -> None:
         buffer = ["y" * 400 for _ in range(500)]
@@ -637,3 +721,252 @@ class KeymapModeTests(unittest.TestCase):
             with self.assertRaises(ai.AiError) as caught:
                 ai.generate(ai.parse_request(self.payload()), client_factory=lambda: client)
         self.assertIn("no Lua", str(caught.exception))
+
+
+class RequestOptionTests(unittest.TestCase):
+    """`full` and `window`, the two knobs a request carries."""
+
+    def parse(self, **extra: object) -> ai.AiRequest:
+        payload = {"line": 1, "prompt": "p", "buffer_lines": ["a"], **extra}
+        return ai.parse_request(json.dumps(payload))
+
+    def test_a_request_is_windowed_by_default(self) -> None:
+        parsed = self.parse()
+        self.assertFalse(parsed.full)
+        self.assertEqual(parsed.window, ai.WINDOW_LINES)
+
+    def test_full_is_accepted(self) -> None:
+        self.assertTrue(self.parse(full=True).full)
+
+    def test_full_must_be_a_boolean(self) -> None:
+        with self.assertRaisesRegex(ai.AiError, "full must be"):
+            self.parse(full="yes")
+
+    def test_the_environment_sets_the_window(self) -> None:
+        with mock.patch.dict(os.environ, {ai.WINDOW_ENV: "25"}):
+            self.assertEqual(self.parse().window, 25)
+
+    def test_an_explicit_window_wins_over_the_environment(self) -> None:
+        with mock.patch.dict(os.environ, {ai.WINDOW_ENV: "25"}):
+            self.assertEqual(self.parse(window=4).window, 4)
+
+    def test_a_nonsense_window_is_a_clean_error(self) -> None:
+        with mock.patch.dict(os.environ, {ai.WINDOW_ENV: "lots"}):
+            with self.assertRaisesRegex(ai.AiError, ai.WINDOW_ENV):
+                self.parse()
+
+    def test_a_zero_window_is_refused(self) -> None:
+        with mock.patch.dict(os.environ, {ai.WINDOW_ENV: "0"}):
+            with self.assertRaisesRegex(ai.AiError, "at least 1"):
+                self.parse()
+
+    def test_a_blank_window_falls_back_to_the_default(self) -> None:
+        with mock.patch.dict(os.environ, {ai.WINDOW_ENV: "  "}):
+            self.assertEqual(self.parse().window, ai.WINDOW_LINES)
+
+    def test_a_bad_request_window_is_refused(self) -> None:
+        for bad in (0, -3, "8", True):
+            with self.subTest(window=bad):
+                with self.assertRaisesRegex(ai.AiError, "window must be"):
+                    self.parse(window=bad)
+
+    def test_the_window_reaches_the_context(self) -> None:
+        buffer = [f"line{i}" for i in range(1, 301)]
+        body = ai.build_input(
+            ai.AiRequest(line=150, prompt="p", buffer_lines=buffer, window=3)
+        )
+        self.assertIn("   147| line147", body)
+        self.assertNotIn("   146| line146", body)
+
+    def test_a_full_request_says_so_in_the_body(self) -> None:
+        buffer = [f"line{i}" for i in range(1, 30)]
+        full = ai.build_input(
+            ai.AiRequest(line=5, prompt="p", buffer_lines=buffer, full=True)
+        )
+        self.assertIn("The whole document is shown below.", full)
+        windowed = ai.build_input(ai.AiRequest(line=5, prompt="p", buffer_lines=buffer))
+        self.assertIn("omitted stretches are labelled", windowed)
+
+
+class DigestModeTests(unittest.TestCase):
+    """The `digest` mode: a preamble in, a summary out."""
+
+    def test_accepts_a_preamble(self) -> None:
+        parsed = ai.parse_request(
+            json.dumps({"mode": "digest", "preamble_text": "\\usepackage{tikz}"})
+        )
+        self.assertEqual(parsed.mode, ai.MODE_DIGEST)
+        self.assertIn("tikz", parsed.preamble_text)
+
+    def test_needs_no_prompt_or_lines(self) -> None:
+        parsed = ai.parse_request(json.dumps({"mode": "digest", "preamble_text": "x"}))
+        self.assertEqual(parsed.prompt, "")
+        self.assertEqual(parsed.buffer_lines, [])
+
+    def test_rejects_a_missing_or_empty_preamble(self) -> None:
+        for bad in ({}, {"preamble_text": ""}, {"preamble_text": 7}):
+            with self.subTest(payload=bad):
+                with self.assertRaisesRegex(ai.AiError, "preamble_text"):
+                    ai.parse_request(json.dumps({"mode": "digest", **bad}))
+
+    def test_the_body_carries_the_preamble(self) -> None:
+        body = ai.build_input(
+            ai.AiRequest(
+                line=0,
+                prompt="",
+                buffer_lines=[],
+                mode=ai.MODE_DIGEST,
+                preamble_text="\\usepackage{tikz}",
+            )
+        )
+        self.assertIn("<<<PREAMBLE", body)
+        self.assertIn("tikz", body)
+
+    def test_its_own_instructions_are_used(self) -> None:
+        digest = ai.AiRequest(
+            line=0, prompt="", buffer_lines=[], mode=ai.MODE_DIGEST, preamble_text="x"
+        )
+        self.assertIs(ai.instructions_for(digest), ai.INSTRUCTIONS_DIGEST)
+        self.assertIn("no code fences", ai.INSTRUCTIONS_DIGEST)
+        self.assertIn("not instructions", ai.INSTRUCTIONS_DIGEST)
+
+    def test_it_uses_the_mini_model(self) -> None:
+        client = StubClient(response("amsmath loaded"))
+        digest = ai.AiRequest(
+            line=0, prompt="", buffer_lines=[], mode=ai.MODE_DIGEST, preamble_text="x"
+        )
+        env = {ai.KEY_ENV: "sk-test", ai.MINI_MODEL_ENV: "mini-model"}
+        with mock.patch.dict(os.environ, env):
+            summary = ai.generate(digest, client_factory=lambda: client)
+        self.assertEqual(summary, "amsmath loaded")
+        self.assertEqual(client.calls[0]["model"], "mini-model")
+
+    def test_an_unset_mini_model_is_a_clean_error(self) -> None:
+        digest = ai.AiRequest(
+            line=0, prompt="", buffer_lines=[], mode=ai.MODE_DIGEST, preamble_text="x"
+        )
+        with mock.patch.dict(os.environ, {ai.KEY_ENV: "sk-test"}):
+            os.environ.pop(ai.MINI_MODEL_ENV, None)
+            with self.assertRaisesRegex(ai.AiError, ai.MINI_MODEL_ENV):
+                ai.generate(digest, client_factory=StubClient)
+
+
+class PreambleDigestTests(unittest.TestCase):
+    """How the cached summary reaches an editing request."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.preamble = Path(self.tmp.name) / "preamble.tex"
+        self.preamble.write_text("\\usepackage{amsmath}\n", encoding="utf-8")
+        env = {
+            "XDG_DATA_HOME": os.path.join(self.tmp.name, "data"),
+            documents.PREAMBLE_ENV: str(self.preamble),
+            ai.MODEL_ENV: "test-model",
+            ai.MINI_MODEL_ENV: "mini-model",
+            ai.KEY_ENV: "sk-test",
+        }
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def client(self) -> "StubClient":
+        """A stub that answers the digest and the generation differently."""
+        stub = StubClient()
+
+        def create(**kwargs: object) -> SimpleNamespace:
+            stub.calls.append(kwargs)
+            if kwargs["model"] == "mini-model":
+                return response("amsmath loaded -- \\text, \\eqref")
+            return response()
+
+        stub.responses.create = create
+        return stub
+
+    def test_the_first_request_summarises_and_the_second_does_not(self) -> None:
+        stub = self.client()
+        ai.generate(request(), client_factory=lambda: stub)
+        self.assertEqual([call["model"] for call in stub.calls], ["mini-model", "test-model"])
+        stub.calls.clear()
+        ai.generate(request(), client_factory=lambda: stub)
+        self.assertEqual([call["model"] for call in stub.calls], ["test-model"])
+
+    def test_the_summary_travels_with_the_request(self) -> None:
+        stub = self.client()
+        ai.generate(request(), client_factory=lambda: stub)
+        body = stub.calls[-1]["input"]
+        self.assertIn("<<<PREAMBLE", body)
+        self.assertIn("amsmath loaded", body)
+        self.assertIn("do not repeat any of it", body)
+
+    def test_the_summary_shortens_the_document_preamble_window(self) -> None:
+        buffer = [f"line{i}" for i in range(1, 301)]
+        stub = self.client()
+        ai.generate(
+            ai.AiRequest(line=200, prompt="p", buffer_lines=buffer),
+            client_factory=lambda: stub,
+        )
+        body = stub.calls[-1]["input"]
+        self.assertIn(f"    {ai.PREAMBLE_LINES_WITH_DIGEST}| ", body)
+        self.assertNotIn(f"    {ai.PREAMBLE_LINES_WITH_DIGEST + 1}| ", body)
+
+    def test_a_fix_request_carries_the_summary_too(self) -> None:
+        stub = self.client()
+        ai.generate(
+            ai.AiRequest(
+                line=1,
+                prompt="Missing }",
+                buffer_lines=["bad {"],
+                mode=ai.MODE_FIX,
+                log_text="./doc.tex:1: Missing } inserted.",
+            ),
+            client_factory=lambda: stub,
+        )
+        self.assertIn("amsmath loaded", stub.calls[-1]["input"])
+
+    def test_a_missing_preamble_costs_nothing(self) -> None:
+        self.preamble.unlink()
+        stub = self.client()
+        snippet = ai.generate(request(), client_factory=lambda: stub)
+        self.assertEqual([call["model"] for call in stub.calls], ["test-model"])
+        self.assertNotIn("<<<PREAMBLE", stub.calls[-1]["input"])
+        self.assertTrue(snippet)
+
+    def test_a_failed_summary_still_produces_latex(self) -> None:
+        stub = StubClient()
+
+        def create(**kwargs: object) -> SimpleNamespace:
+            stub.calls.append(kwargs)
+            if kwargs["model"] == "mini-model":
+                raise RuntimeError("the summary call fell over")
+            return response()
+
+        stub.responses.create = create
+        snippet = ai.generate(request(), client_factory=lambda: stub)
+        self.assertEqual(snippet, "\\begin{equation}\n  x = 1\n\\end{equation}")
+        self.assertNotIn("<<<PREAMBLE", stub.calls[-1]["input"])
+        self.assertFalse(preamble.cache_path().exists())
+
+    def test_an_unset_mini_model_does_not_stop_a_generation(self) -> None:
+        os.environ.pop(ai.MINI_MODEL_ENV)
+        stub = self.client()
+        self.assertTrue(ai.generate(request(), client_factory=lambda: stub))
+        self.assertEqual([call["model"] for call in stub.calls], ["test-model"])
+
+    def test_an_edited_preamble_is_summarised_again(self) -> None:
+        stub = self.client()
+        ai.generate(request(), client_factory=lambda: stub)
+        self.preamble.write_text("\\usepackage{tikz}\n", encoding="utf-8")
+        stub.calls.clear()
+        ai.generate(request(), client_factory=lambda: stub)
+        self.assertEqual([call["model"] for call in stub.calls], ["mini-model", "test-model"])
+
+    def test_a_keymap_request_never_summarises(self) -> None:
+        stub = self.client()
+        ai.generate(
+            ai.AiRequest(
+                line=0, prompt="a shortcut", buffer_lines=[], mode=ai.MODE_KEYMAP
+            ),
+            client_factory=lambda: stub,
+        )
+        self.assertEqual([call["model"] for call in stub.calls], ["test-model"])

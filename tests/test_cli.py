@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from texman import index
@@ -245,6 +246,93 @@ class AiCommandTests(unittest.TestCase):
         db = Path(tempfile.mkdtemp()) / "never-created.sqlite3"
         payload = json.dumps({"line": 5, "prompt": "p", "buffer_lines": ["a"]})
         result = run(["--db", str(db), "ai"], stdin=payload)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(db.exists())
+
+    def test_a_nonsense_window_is_reported_not_raised(self) -> None:
+        payload = json.dumps({"line": 1, "prompt": "p", "buffer_lines": ["a"]})
+        result = run(["ai"], stdin=payload, env={"TEXMAN_WINDOW_LINES": "plenty"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("TEXMAN_WINDOW_LINES", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+
+class PreambleCommandTests(unittest.TestCase):
+    """`texman preamble` summarises the template, and explains any refusal."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.preamble = Path(self.tmp.name) / "preamble.tex"
+        self.preamble.write_text("\\documentclass{article}\n", encoding="utf-8")
+        # Never the developer's own cache.
+        self.env = {
+            "XDG_DATA_HOME": str(Path(self.tmp.name) / "data"),
+            "TEXMAN_PREAMBLE": str(self.preamble),
+        }
+
+    def test_it_is_offered_in_the_help(self) -> None:
+        self.assertIn("preamble", run(["--help"]).stdout)
+
+    def test_missing_key_is_reported(self) -> None:
+        env = {
+            **self.env,
+            "TEXMAN_OPENAI_MINI_MODEL": "mini",
+            "OPENAI_API_KEY": "",
+        }
+        result = run(["preamble"], env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("OPENAI_API_KEY", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_missing_mini_model_is_reported(self) -> None:
+        env = {
+            **self.env,
+            "OPENAI_API_KEY": "sk-not-used",
+            "TEXMAN_OPENAI_MINI_MODEL": "",
+        }
+        result = run(["preamble"], env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TEXMAN_OPENAI_MINI_MODEL", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_a_missing_preamble_is_reported(self) -> None:
+        self.preamble.unlink()
+        env = {
+            **self.env,
+            "OPENAI_API_KEY": "sk-not-used",
+            "TEXMAN_OPENAI_MINI_MODEL": "mini",
+        }
+        result = run(["preamble"], env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no preamble", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_a_cached_summary_needs_no_request(self) -> None:
+        """A warm cache is reported without a key or a model being configured."""
+        from texman import preamble
+
+        data = Path(self.tmp.name) / "data"
+        with unittest.mock.patch.dict(
+            os.environ, {"XDG_DATA_HOME": str(data)}, clear=False
+        ):
+            preamble.store(
+                self.preamble,
+                self.preamble.read_text(encoding="utf-8"),
+                "article class",
+                "mini",
+            )
+        env = {**self.env, "OPENAI_API_KEY": "", "TEXMAN_OPENAI_MINI_MODEL": ""}
+        result = run(["preamble", "--show"], env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already current", result.stdout)
+        self.assertIn("article class", result.stdout)
+
+    def test_it_does_not_touch_the_catalog(self) -> None:
+        db = Path(self.tmp.name) / "never-created.sqlite3"
+        env = {**self.env, "TEXMAN_OPENAI_MINI_MODEL": "mini", "OPENAI_API_KEY": ""}
+        result = run(["--db", str(db), "preamble"], env=env)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(db.exists())
 
